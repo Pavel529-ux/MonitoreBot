@@ -6,16 +6,17 @@ import requests
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 WB_FEED_URLS       = [u.strip() for u in os.getenv("WB_FEED_URLS","").split(",") if u.strip()]
-CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", "600"))  # сек между циклами
+CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", "600"))
 MAX_PAGES          = int(os.getenv("MAX_PAGES", "10"))
-REDIS_URL          = os.getenv("REDIS_URL")                   # опционально
-PROXY_URL          = os.getenv("PROXY_URL")                   # например: http://user:pass@host:port
+REDIS_URL          = os.getenv("REDIS_URL")
+PROXY_URL          = os.getenv("PROXY_URL")                 # для WB; Telegram идёт без прокси
+PROXY_TG_URL       = os.getenv("PROXY_TG_URL")              # опционально: отдельный прокси для TG
 DEBUG              = os.getenv("DEBUG", "1") == "1"
 
 if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and WB_FEED_URLS):
     raise SystemExit("Нужно задать TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, WB_FEED_URLS")
 
-# Реалистичные заголовки (локаль RU и реальный браузер)
+# Реалистичные заголовки (локаль RU)
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -25,15 +26,34 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
-# Плашка вида "80 ₽ за отзыв" (1–6 цифр: 10..100000)
 BONUS_RE = re.compile(r'(\d{1,6})\s*(?:₽|руб\w*|балл\w*)\s+за\s+отзыв', re.I)
 
-# ===== HTTP-клиент с заголовками и (опционально) прокси =====
-session = requests.Session()
-session.headers.update(HEADERS)
-if PROXY_URL:
-    session.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
-    print("[init] Proxy enabled")
+# ===== Валидация прокси =====
+def _valid_proxy(url: str) -> bool:
+    try:
+        u = urlparse(url)
+        return u.scheme in ("http","https","socks5","socks5h") and bool(u.netloc) and (":" in u.netloc)
+    except Exception:
+        return False
+
+# ===== HTTP-сессии =====
+# WB — отдельная сессия (с прокси если есть)
+wb_session = requests.Session()
+wb_session.headers.update(HEADERS)
+if PROXY_URL and _valid_proxy(PROXY_URL):
+    wb_session.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
+    print("[init] WB proxy enabled")
+elif PROXY_URL:
+    print("[init] WB proxy ignored: invalid PROXY_URL")
+
+# Telegram — отдельная сессия (по умолчанию без прокси)
+tg_session = requests.Session()
+tg_session.headers.update({"User-Agent": HEADERS["User-Agent"]})
+if PROXY_TG_URL and _valid_proxy(PROXY_TG_URL):
+    tg_session.proxies.update({"http": PROXY_TG_URL, "https": PROXY_TG_URL})
+    print("[init] TG proxy enabled")
+elif PROXY_TG_URL:
+    print("[init] TG proxy ignored: invalid PROXY_TG_URL")
 
 # ===== Redis (анти-дубли) =====
 rds = None
@@ -48,7 +68,6 @@ if REDIS_URL:
         rds = None
 
 local_sent = set()
-
 def already_sent(nm_id: int) -> bool:
     key = f"sent:{nm_id}"
     if rds:
@@ -77,7 +96,7 @@ def del_param(url: str, key: str) -> str:
     return urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q, doseq=True), u.fragment))
 
 def http_json(url: str):
-    r = session.get(url, timeout=25)
+    r = wb_session.get(url, timeout=25)
     if DEBUG and (r.status_code != 200 or ("captcha" in r.text.lower() or "access denied" in r.text.lower())):
         print(f"[debug] http {r.status_code} {urlparse(url).netloc} len={len(r.text)}")
         print(f"[debug] head sample: {r.text[:160].replace(chr(10),' ')}")
@@ -122,7 +141,7 @@ def bonus_from_json(item) -> int | None:
 def bonus_from_card_html(nm_id: int) -> int | None:
     url = f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx"
     try:
-        r = session.get(url, timeout=25)
+        r = wb_session.get(url, timeout=25)
         if r.ok:
             m = BONUS_RE.search(r.text)
             if m: return int(m.group(1))
@@ -133,20 +152,21 @@ def bonus_from_card_html(nm_id: int) -> int | None:
 def send_telegram(text: str):
     api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    r = None
     try:
-        r = session.post(api, json=payload, timeout=20)
+        r = tg_session.post(api, json=payload, timeout=20)
         j = r.json()
         if not j.get("ok"):
             print(f"[telegram] not ok: {j}")
     except Exception as e:
         print("[telegram] request failed:", e)
-        print("[telegram] status/text:", getattr(r, "status_code", "?"), getattr(r, "text", "")[:200])
+        if r is not None:
+            print("[telegram] status/text:", r.status_code, r.text[:200])
 
 def one_scan() -> int:
     sent = 0
     for feed in WB_FEED_URLS:
-        # всегда работаем без серверного ffeedbackpoints: ищем плашку сами
-        feed_nf = del_param(feed, "ffeedbackpoints")
+        feed_nf = del_param(feed, "ffeedbackpoints")  # клиентский фильтр
         print("[debug] client-side filter mode")
         try:
             for item in iter_products(feed_nf, MAX_PAGES, label="scan"):
