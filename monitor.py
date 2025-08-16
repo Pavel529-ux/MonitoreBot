@@ -5,13 +5,24 @@ import requests
 # ===== Конфиг =====
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-WB_FEED_URLS       = [u.strip() for u in os.getenv("WB_FEED_URLS","").split(",") if u.strip()]
+
+# ВАЖНО: WB_FEED_URLS разделяй ИЛИ символом |, ИЛИ пробелом/переносом строки (НЕ запятой!)
+# Пример: "https://...page=1&cat=631 ... | https://...resultset=catalog&page=1&query=..."
+urls_raw = os.getenv("WB_FEED_URLS", "").strip()
+WB_FEED_URLS = [u for u in re.split(r"[|\s]+", urls_raw) if u and u.startswith("http")]
+
 CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", "600"))
 MAX_PAGES          = int(os.getenv("MAX_PAGES", "10"))
 REDIS_URL          = os.getenv("REDIS_URL")
-PROXY_URL          = os.getenv("PROXY_URL")                 # для WB; Telegram идёт без прокси
-PROXY_TG_URL       = os.getenv("PROXY_TG_URL")              # опционально: отдельный прокси для TG
+# Прокси только для WB. Telegram идёт без прокси по умолчанию.
+PROXY_URL          = os.getenv("PROXY_URL")                 # http://user:pass@host:port ИЛИ socks5h://user:pass@host:port
+PROXY_TG_URL       = os.getenv("PROXY_TG_URL")              # опционально — отдельный прокси для Telegram
 DEBUG              = os.getenv("DEBUG", "1") == "1"
+
+if DEBUG:
+    print(f"[debug] feeds parsed: {len(WB_FEED_URLS)}")
+    for i, u in enumerate(WB_FEED_URLS, 1):
+        print(f"[debug] feed[{i}]: {u[:160]}...")
 
 if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and WB_FEED_URLS):
     raise SystemExit("Нужно задать TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, WB_FEED_URLS")
@@ -26,13 +37,14 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
+# Плашка вида "80 ₽ за отзыв" (1–6 цифр: 10..100000)
 BONUS_RE = re.compile(r'(\d{1,6})\s*(?:₽|руб\w*|балл\w*)\s+за\s+отзыв', re.I)
 
 # ===== Валидация прокси =====
 def _valid_proxy(url: str) -> bool:
     try:
         u = urlparse(url)
-        return u.scheme in ("http","https","socks5","socks5h") and bool(u.netloc) and (":" in u.netloc)
+        return u.scheme in ("http", "https", "socks5", "socks5h") and bool(u.netloc) and (":" in u.netloc)
     except Exception:
         return False
 
@@ -40,20 +52,22 @@ def _valid_proxy(url: str) -> bool:
 # WB — отдельная сессия (с прокси если есть)
 wb_session = requests.Session()
 wb_session.headers.update(HEADERS)
-if PROXY_URL and _valid_proxy(PROXY_URL):
-    wb_session.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
-    print("[init] WB proxy enabled")
-elif PROXY_URL:
-    print("[init] WB proxy ignored: invalid PROXY_URL")
+if PROXY_URL:
+    if _valid_proxy(PROXY_URL):
+        wb_session.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
+        print("[init] WB proxy enabled")
+    else:
+        print("[init] WB proxy ignored: invalid PROXY_URL")
 
 # Telegram — отдельная сессия (по умолчанию без прокси)
 tg_session = requests.Session()
 tg_session.headers.update({"User-Agent": HEADERS["User-Agent"]})
-if PROXY_TG_URL and _valid_proxy(PROXY_TG_URL):
-    tg_session.proxies.update({"http": PROXY_TG_URL, "https": PROXY_TG_URL})
-    print("[init] TG proxy enabled")
-elif PROXY_TG_URL:
-    print("[init] TG proxy ignored: invalid PROXY_TG_URL")
+if PROXY_TG_URL:
+    if _valid_proxy(PROXY_TG_URL):
+        tg_session.proxies.update({"http": PROXY_TG_URL, "https": PROXY_TG_URL})
+        print("[init] TG proxy enabled")
+    else:
+        print("[init] TG proxy ignored: invalid PROXY_TG_URL")
 
 # ===== Redis (анти-дубли) =====
 rds = None
@@ -81,7 +95,7 @@ def mark_sent(nm_id: int):
     key = f"sent:{nm_id}"
     if rds:
         try:
-            rds.set(key, "1", ex=7*24*3600)
+            rds.set(key, "1", ex=7*24*3600)  # помним 7 дней
         except Exception:
             pass
     local_sent.add(nm_id)
@@ -111,7 +125,8 @@ def iter_products(feed_url: str, max_pages: int, label: str):
         products = (data.get("data") or {}).get("products") or []
         host = urlparse(url).netloc
         if DEBUG: print(f"[debug] {label} page={p} products={len(products)} host={host}")
-        if not products: break
+        if not products:
+            break
         total += len(products)
         for item in products:
             yield item
@@ -166,7 +181,8 @@ def send_telegram(text: str):
 def one_scan() -> int:
     sent = 0
     for feed in WB_FEED_URLS:
-        feed_nf = del_param(feed, "ffeedbackpoints")  # клиентский фильтр
+        # всегда клиент-сайд: убираем серверный ffeedbackpoints, ищем плашку сами
+        feed_nf = del_param(feed, "ffeedbackpoints")
         print("[debug] client-side filter mode")
         try:
             for item in iter_products(feed_nf, MAX_PAGES, label="scan"):
@@ -197,7 +213,7 @@ def one_scan() -> int:
                 mark_sent(nm)
                 sent += 1
                 if DEBUG: print(f"[debug] sent nm={nm}, bonus={bonus}, price={price}")
-                time.sleep(0.35)
+                time.sleep(0.35)  # бережём API
         except Exception as e:
             print("[warn] feed failed:", e)
             traceback.print_exc()
@@ -227,3 +243,4 @@ def main_loop():
 
 if __name__ == "__main__":
     main_loop()
+
