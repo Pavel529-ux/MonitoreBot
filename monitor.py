@@ -2,15 +2,14 @@ import os, re, time, signal, traceback
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import requests
 
-# ===== Конфиг через переменные окружения =====
+# ===== Конфиг =====
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 WB_FEED_URLS       = [u.strip() for u in os.getenv("WB_FEED_URLS","").split(",") if u.strip()]
-
-CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL", "600"))  # сек между циклами (по умолчанию 10 мин)
-MAX_PAGES       = int(os.getenv("MAX_PAGES", "10"))        # разумная глубина
-REDIS_URL       = os.getenv("REDIS_URL")                   # опционально
-DEBUG           = os.getenv("DEBUG", "1") == "1"           # подробные логи
+CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", "600"))  # сек между циклами
+MAX_PAGES          = int(os.getenv("MAX_PAGES", "10"))        # разумная глубина
+REDIS_URL          = os.getenv("REDIS_URL")                   # опционально
+DEBUG              = os.getenv("DEBUG", "1") == "1"
 
 if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and WB_FEED_URLS):
     raise SystemExit("Нужно задать TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, WB_FEED_URLS")
@@ -32,23 +31,25 @@ if REDIS_URL:
         print("[init] Redis connect error:", e)
         rds = None
 
-local_seen = set()
-def seen_before(nm_id: int) -> bool:
-    key = f"seen:{nm_id}"
+local_sent = set()
+
+def already_sent(nm_id: int) -> bool:
+    key = f"sent:{nm_id}"
     if rds:
         try:
-            if rds.get(key):
-                if DEBUG: print(f"[debug] skip duplicate nm={nm_id}")
-                return True
-            rds.set(key, "1", ex=7*24*3600)
-            return False
+            return rds.exists(key) == 1
         except Exception:
             pass
-    if nm_id in local_seen:
-        if DEBUG: print(f"[debug] skip duplicate (local) nm={nm_id}")
-        return True
-    local_seen.add(nm_id)
-    return False
+    return nm_id in local_sent
+
+def mark_sent(nm_id: int):
+    key = f"sent:{nm_id}"
+    if rds:
+        try:
+            rds.set(key, "1", ex=7*24*3600)
+        except Exception:
+            pass
+    local_sent.add(nm_id)
 
 def set_param(url: str, key: str, value) -> str:
     u = urlparse(url); q = parse_qs(u.query); q[key] = [str(value)]
@@ -64,8 +65,7 @@ def http_json(url: str):
     r.raise_for_status()
     return r.json()
 
-def fetch_products(feed_url: str, max_pages: int, label: str):
-    """Итерируем товары с пагинацией, печатаем логи."""
+def iter_products(feed_url: str, max_pages: int, label: str):
     total = 0
     for p in range(1, max_pages + 1):
         url = set_param(feed_url, "page", p)
@@ -77,9 +77,7 @@ def fetch_products(feed_url: str, max_pages: int, label: str):
         total += len(products)
         for item in products:
             yield item
-    if DEBUG and total == 0:
-        print(f"[debug] {label} total=0")
-    return total
+    if DEBUG: print(f"[debug] {label} total={total}")
 
 def extract_bonus_from_any(obj):
     if isinstance(obj, str):
@@ -95,7 +93,15 @@ def extract_bonus_from_any(obj):
             if b: return b
     return None
 
-def fallback_bonus_from_card(nm_id: int):
+def bonus_from_json(item) -> int | None:
+    # пробуем типичные поля, где WB отдаёт текст плашек
+    for key in ("promoTextCard", "promoTextCat", "description", "extended", "badges"):
+        if key in item:
+            b = extract_bonus_from_any(item[key])
+            if b: return b
+    return None
+
+def bonus_from_card_html(nm_id: int) -> int | None:
     url = f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx"
     try:
         r = requests.get(url, headers={"User-Agent": UA}, timeout=25)
@@ -106,15 +112,6 @@ def fallback_bonus_from_card(nm_id: int):
         pass
     return None
 
-def has_bonus_badge(item) -> int | None:
-    """Пытаемся найти размер бонуса в JSON; если нет — вернём None (потом попробуем HTML)."""
-    for key in ("promoTextCard", "promoTextCat", "description", "extended", "badges"):
-        if key in item:
-            b = extract_bonus_from_any(item[key])
-            if b: return b
-    return None
-
-# ===== Отправка в Telegram с проверкой ответа =====
 def send_telegram(text: str):
     api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
@@ -130,53 +127,32 @@ def send_telegram(text: str):
 def one_scan() -> int:
     sent = 0
     for feed in WB_FEED_URLS:
-        if DEBUG: print(f"[debug] scan feed: {feed[:160]}...")
+        # снимаем серверный фильтр, если он есть — фильтруем сами
+        feed_nf = del_param(feed, "ffeedbackpoints")
+        if DEBUG and feed != feed_nf:
+            print("[debug] removed ffeedbackpoints from feed (client-side filter mode)")
+        else:
+            print("[debug] scanning feed as-is (client-side filter mode)")
+
         try:
-            # 1) Пытаемся довериться серверному фильтру (ffeedbackpoints=1)
-            server_total = fetch_products(feed, MAX_PAGES, label="server")
-            use_fallback = False
-
-            # 2) Если сервер ничего не дал — снимаем фильтр и ищем плашку сами
-            if server_total == 0 and ("ffeedbackpoints=1" in feed or "ffeedbackpoints%3D1" in feed):
-                feed_nf = del_param(feed, "ffeedbackpoints")
-                print("[fallback] server filter empty — scanning without ffeedbackpoints and detecting badge client-side")
-                client_total = 0
-                for item in fetch_products(feed_nf, MAX_PAGES, label="client"):
-                    client_total += 1
-                    nm = item.get("id") or item.get("nmId") or item.get("nm")
-                    if not nm:
-                        continue
-                    nm = int(nm)
-                    if seen_before(nm):
-                        continue
-
-                    bonus = has_bonus_badge(item)
-                    if bonus is None:
-                        bonus = fallback_bonus_from_card(nm)
-
-                    if bonus is None:
-                        continue  # нет плашки — пропускаем
-
-                    name = item.get("name") or "Без названия"
-                    price_u = item.get("salePriceU") or item.get("priceU") or 0
-                    price = int(price_u) // 100 if price_u else 0
-                    link = f"https://www.wildberries.ru/catalog/{nm}/detail.aspx"
-
-                    msg = f"🎯 Баллы за отзыв\n{name}\nБонус: {bonus} ₽ | Цена: {price} ₽\n{link}"
-                    send_telegram(msg)
-                    sent += 1
-                    if DEBUG: print(f"[debug] sent (client) nm={nm}, bonus={bonus}, price={price}")
-                    time.sleep(0.35)
-                # переходим к следующему фиду
-                continue
-
-            # 3) Если серверный фильтр дал товары — просто шлём (он уже отфильтрован)
-            for item in fetch_products(feed, MAX_PAGES, label="server-pass2"):
+            for item in iter_products(feed_nf, MAX_PAGES, label="scan"):
                 nm = item.get("id") or item.get("nmId") or item.get("nm")
                 if not nm:
                     continue
                 nm = int(nm)
-                if seen_before(nm):
+
+                # ищем плашку «... за отзыв» (сумма любая)
+                bonus = bonus_from_json(item)
+                if bonus is None:
+                    bonus = bonus_from_card_html(nm)
+                    # чуть притормаживаем при HTML-фолбэке
+                    time.sleep(0.25)
+
+                if bonus is None:
+                    continue  # нет плашки — пропускаем
+
+                if already_sent(nm):
+                    if DEBUG: print(f"[debug] skip duplicate nm={nm}")
                     continue
 
                 name = item.get("name") or "Без названия"
@@ -184,27 +160,19 @@ def one_scan() -> int:
                 price = int(price_u) // 100 if price_u else 0
                 link = f"https://www.wildberries.ru/catalog/{nm}/detail.aspx"
 
-                bonus = has_bonus_badge(item)
-                if bonus is None:
-                    bonus = fallback_bonus_from_card(nm)
-
-                if bonus:
-                    msg = f"🎯 Баллы за отзыв\n{name}\nБонус: {bonus} ₽ | Цена: {price} ₽\n{link}"
-                else:
-                    msg = f"🎯 Баллы за отзыв\n{name}\nЦена: {price} ₽\n{link}"
-
+                msg = f"🎯 Баллы за отзыв\n{name}\nБонус: {bonus} ₽ | Цена: {price} ₽\n{link}"
                 send_telegram(msg)
+                mark_sent(nm)
                 sent += 1
-                if DEBUG: print(f"[debug] sent (server) nm={nm}, bonus={bonus}, price={price}")
-                time.sleep(0.35)
-
+                if DEBUG: print(f"[debug] sent nm={nm}, bonus={bonus}, price={price}")
+                time.sleep(0.35)  # бережём API
         except Exception as e:
             print("[warn] feed failed:", e)
             traceback.print_exc()
             time.sleep(1.0)
     return sent
 
-# ===== 24/7 цикл с корректным завершением =====
+# ===== 24/7 цикл =====
 stop_flag = False
 def handle_stop(sig, frame):
     global stop_flag
