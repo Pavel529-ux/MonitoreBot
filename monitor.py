@@ -7,17 +7,33 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 WB_FEED_URLS       = [u.strip() for u in os.getenv("WB_FEED_URLS","").split(",") if u.strip()]
 CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", "600"))  # сек между циклами
-MAX_PAGES          = int(os.getenv("MAX_PAGES", "10"))        # разумная глубина
+MAX_PAGES          = int(os.getenv("MAX_PAGES", "10"))
 REDIS_URL          = os.getenv("REDIS_URL")                   # опционально
+PROXY_URL          = os.getenv("PROXY_URL")                   # например: http://user:pass@host:port
 DEBUG              = os.getenv("DEBUG", "1") == "1"
 
 if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and WB_FEED_URLS):
     raise SystemExit("Нужно задать TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, WB_FEED_URLS")
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+# Реалистичные заголовки (локаль RU и реальный браузер)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Origin": "https://www.wildberries.ru",
+    "Referer": "https://www.wildberries.ru/",
+    "Connection": "keep-alive",
+}
 
 # Плашка вида "80 ₽ за отзыв" (1–6 цифр: 10..100000)
 BONUS_RE = re.compile(r'(\d{1,6})\s*(?:₽|руб\w*|балл\w*)\s+за\s+отзыв', re.I)
+
+# ===== HTTP-клиент с заголовками и (опционально) прокси =====
+session = requests.Session()
+session.headers.update(HEADERS)
+if PROXY_URL:
+    session.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
+    print("[init] Proxy enabled")
 
 # ===== Redis (анти-дубли) =====
 rds = None
@@ -61,7 +77,10 @@ def del_param(url: str, key: str) -> str:
     return urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q, doseq=True), u.fragment))
 
 def http_json(url: str):
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=25)
+    r = session.get(url, timeout=25)
+    if DEBUG and (r.status_code != 200 or ("captcha" in r.text.lower() or "access denied" in r.text.lower())):
+        print(f"[debug] http {r.status_code} {urlparse(url).netloc} len={len(r.text)}")
+        print(f"[debug] head sample: {r.text[:160].replace(chr(10),' ')}")
     r.raise_for_status()
     return r.json()
 
@@ -94,7 +113,6 @@ def extract_bonus_from_any(obj):
     return None
 
 def bonus_from_json(item) -> int | None:
-    # пробуем типичные поля, где WB отдаёт текст плашек
     for key in ("promoTextCard", "promoTextCat", "description", "extended", "badges"):
         if key in item:
             b = extract_bonus_from_any(item[key])
@@ -104,7 +122,7 @@ def bonus_from_json(item) -> int | None:
 def bonus_from_card_html(nm_id: int) -> int | None:
     url = f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx"
     try:
-        r = requests.get(url, headers={"User-Agent": UA}, timeout=25)
+        r = session.get(url, timeout=25)
         if r.ok:
             m = BONUS_RE.search(r.text)
             if m: return int(m.group(1))
@@ -116,7 +134,7 @@ def send_telegram(text: str):
     api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
     try:
-        r = requests.post(api, json=payload, timeout=20)
+        r = session.post(api, json=payload, timeout=20)
         j = r.json()
         if not j.get("ok"):
             print(f"[telegram] not ok: {j}")
@@ -127,13 +145,9 @@ def send_telegram(text: str):
 def one_scan() -> int:
     sent = 0
     for feed in WB_FEED_URLS:
-        # снимаем серверный фильтр, если он есть — фильтруем сами
+        # всегда работаем без серверного ffeedbackpoints: ищем плашку сами
         feed_nf = del_param(feed, "ffeedbackpoints")
-        if DEBUG and feed != feed_nf:
-            print("[debug] removed ffeedbackpoints from feed (client-side filter mode)")
-        else:
-            print("[debug] scanning feed as-is (client-side filter mode)")
-
+        print("[debug] client-side filter mode")
         try:
             for item in iter_products(feed_nf, MAX_PAGES, label="scan"):
                 nm = item.get("id") or item.get("nmId") or item.get("nm")
@@ -141,15 +155,13 @@ def one_scan() -> int:
                     continue
                 nm = int(nm)
 
-                # ищем плашку «... за отзыв» (сумма любая)
                 bonus = bonus_from_json(item)
                 if bonus is None:
                     bonus = bonus_from_card_html(nm)
-                    # чуть притормаживаем при HTML-фолбэке
-                    time.sleep(0.25)
+                    time.sleep(0.2)
 
                 if bonus is None:
-                    continue  # нет плашки — пропускаем
+                    continue
 
                 if already_sent(nm):
                     if DEBUG: print(f"[debug] skip duplicate nm={nm}")
@@ -165,7 +177,7 @@ def one_scan() -> int:
                 mark_sent(nm)
                 sent += 1
                 if DEBUG: print(f"[debug] sent nm={nm}, bonus={bonus}, price={price}")
-                time.sleep(0.35)  # бережём API
+                time.sleep(0.35)
         except Exception as e:
             print("[warn] feed failed:", e)
             traceback.print_exc()
