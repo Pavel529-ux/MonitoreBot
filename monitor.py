@@ -2,29 +2,34 @@ import os, re, time, signal, traceback, random
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import requests
 
-# ===== Конфиг =====
+# =======================
+#       К О Н Ф И Г
+# =======================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-# ВАЖНО: WB_FEED_URLS разделяй ИЛИ символом |, ИЛИ пробелом/переносом строки (НЕ запятой!)
+# ВАЖНО: WB_FEED_URLS разделяй символом | или пробелом/переносом строки (НЕ запятая!)
 urls_raw = os.getenv("WB_FEED_URLS", "").strip()
 WB_FEED_URLS = [u for u in re.split(r"[|\s]+", urls_raw) if u and u.startswith("http")]
 
-CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", "600"))
-MAX_PAGES          = int(os.getenv("MAX_PAGES", "8"))       # стало скромнее по умолчанию
+CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", "900"))
+MAX_PAGES          = int(os.getenv("MAX_PAGES", "5"))
 REDIS_URL          = os.getenv("REDIS_URL")
 
-# Прокси только для WB. Telegram идёт без прокси по умолчанию.
-PROXY_URL          = os.getenv("PROXY_URL")                 # http://user:pass@host:port ИЛИ socks5h://user:pass@host:port
-PROXY_TG_URL       = os.getenv("PROXY_TG_URL")              # опционально — отдельный прокси для Telegram
+# Прокси для WB: можно указать один PROXY_URL или пул PROXY_POOL (через |)
+PROXY_URL          = os.getenv("PROXY_URL")                 # http://user:pass@host:port или socks5h://user:pass@host:port
+PROXY_POOL         = os.getenv("PROXY_POOL", "")            # несколько прокси: "http://u:p@ip1:port|socks5h://u:p@ip2:port"
+# Отдельный прокси для Telegram (обычно НЕ нужен):
+PROXY_TG_URL       = os.getenv("PROXY_TG_URL")
+
 DEBUG              = os.getenv("DEBUG", "1") == "1"
 
-# Анти-429 настройки (можно править через переменные)
-WB_PAGE_DELAY_MIN  = float(os.getenv("WB_PAGE_DELAY_MIN", "0.9"))   # сек между запросами к WB (минимум)
-WB_PAGE_DELAY_MAX  = float(os.getenv("WB_PAGE_DELAY_MAX", "1.7"))   # сек (максимум)
-WB_HTML_PROBE_LIMIT= int(os.getenv("WB_HTML_PROBE_LIMIT","6"))       # максимум HTML-проверок на ОДНУ страницу каталога
-WB_MAX_RETRIES     = int(os.getenv("WB_MAX_RETRIES", "5"))          # ретраи при 429/403/503
-WB_BACKOFF_BASE    = float(os.getenv("WB_BACKOFF_BASE", "2.0"))     # экспоненциальная задержка: base * 2^attempt (+джиттер)
+# Анти-429 настройки
+WB_PAGE_DELAY_MIN  = float(os.getenv("WB_PAGE_DELAY_MIN", "1.2"))
+WB_PAGE_DELAY_MAX  = float(os.getenv("WB_PAGE_DELAY_MAX", "2.5"))
+WB_HTML_PROBE_LIMIT= int(os.getenv("WB_HTML_PROBE_LIMIT","3"))
+WB_MAX_RETRIES     = int(os.getenv("WB_MAX_RETRIES", "2"))
+WB_BACKOFF_BASE    = float(os.getenv("WB_BACKOFF_BASE", "4.0"))
 
 if DEBUG:
     print(f"[debug] feeds parsed: {len(WB_FEED_URLS)}")
@@ -57,26 +62,56 @@ def _valid_proxy(url: str) -> bool:
 def _wb_delay():
     return random.uniform(WB_PAGE_DELAY_MIN, WB_PAGE_DELAY_MAX)
 
-# ===== HTTP-сессии =====
-wb_session = requests.Session()
-wb_session.headers.update(HEADERS)
-if PROXY_URL:
-    if _valid_proxy(PROXY_URL):
-        wb_session.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
+# =======================
+#      С Е С С И И
+# =======================
+def build_wb_session(proxy: str | None):
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    if proxy and _valid_proxy(proxy):
+        s.proxies.update({"http": proxy, "https": proxy})
+        print(f"[proxy] WB via {proxy.split('@')[-1]}")
+    return s
+
+def _split_list(s: str):
+    return [p for p in re.split(r"[|\s]+", (s or "").strip()) if p]
+
+_proxy_list = _split_list(PROXY_POOL)
+_current_proxy_idx = -1
+wb_session = None  # заполняем ниже
+
+def rotate_proxy(reason=""):
+    """Переключает прокси из пула. Возвращает True, если удалось переключить."""
+    global wb_session, _current_proxy_idx
+    if not _proxy_list:
+        return False
+    _current_proxy_idx = (_current_proxy_idx + 1) % len(_proxy_list)
+    wb_session = build_wb_session(_proxy_list[_current_proxy_idx])
+    print(f"[proxy] rotated ({reason}). now {_current_proxy_idx+1}/{len(_proxy_list)}")
+    return True
+
+# Инициализация WB-сессии
+if _proxy_list:
+    rotate_proxy("init")
+else:
+    wb_session = build_wb_session(PROXY_URL)
+    if PROXY_URL and _valid_proxy(PROXY_URL):
         print("[init] WB proxy enabled")
-    else:
+    elif PROXY_URL:
         print("[init] WB proxy ignored: invalid PROXY_URL")
 
+# Telegram — отдельная сессия (обычно без прокси)
 tg_session = requests.Session()
 tg_session.headers.update({"User-Agent": HEADERS["User-Agent"]})
-if PROXY_TG_URL:
-    if _valid_proxy(PROXY_TG_URL):
-        tg_session.proxies.update({"http": PROXY_TG_URL, "https": PROXY_TG_URL})
-        print("[init] TG proxy enabled")
-    else:
-        print("[init] TG proxy ignored: invalid PROXY_TG_URL")
+if PROXY_TG_URL and _valid_proxy(PROXY_TG_URL):
+    tg_session.proxies.update({"http": PROXY_TG_URL, "https": PROXY_TG_URL})
+    print("[init] TG proxy enabled")
+elif PROXY_TG_URL:
+    print("[init] TG proxy ignored: invalid PROXY_TG_URL")
 
-# ===== Redis (анти-дубли) =====
+# =======================
+#     R E D I S (опц.)
+# =======================
 rds = None
 if REDIS_URL:
     try:
@@ -107,6 +142,9 @@ def mark_sent(nm_id: int):
             pass
     local_sent.add(nm_id)
 
+# =======================
+#      У Т И Л И Т Ы
+# =======================
 def set_param(url: str, key: str, value) -> str:
     u = urlparse(url); q = parse_qs(u.query); q[key] = [str(value)]
     return urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q, doseq=True), u.fragment))
@@ -116,17 +154,22 @@ def del_param(url: str, key: str) -> str:
     if key in q: del q[key]
     return urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q, doseq=True), u.fragment))
 
-# ===== HTTP JSON c ретраями и экспоненциальным backoff =====
+# =======================
+#   HTTP JSON + backoff
+# =======================
 def http_json(url: str):
     attempt = 0
     while True:
         r = wb_session.get(url, timeout=25)
         if DEBUG and (r.status_code != 200 or ("captcha" in r.text.lower() or "access denied" in r.text.lower())):
             print(f"[debug] http {r.status_code} {urlparse(url).netloc} len={len(r.text)}")
-            head = r.text[:160].replace("\n"," ")
-            if head: print(f"[debug] head sample: {head}")
         if r.status_code in (429, 403, 503):
             if attempt >= WB_MAX_RETRIES:
+                # пробуем сменить прокси из пула
+                if rotate_proxy(f"{r.status_code} on {urlparse(url).path}"):
+                    attempt = 0
+                    time.sleep(random.uniform(2.0, 4.0))  # пауза после смены IP
+                    continue
                 r.raise_for_status()
             wait = min(90.0, WB_BACKOFF_BASE * (2 ** attempt)) + random.uniform(0.0, 1.5)
             print(f"[rate] {r.status_code} on {urlparse(url).path} — wait {wait:.1f}s (attempt {attempt+1}/{WB_MAX_RETRIES})")
@@ -134,8 +177,7 @@ def http_json(url: str):
             attempt += 1
             continue
         r.raise_for_status()
-        # темпуем даже при успехе
-        time.sleep(_wb_delay())
+        time.sleep(_wb_delay())  # темп даже при успехе
         return r.json()
 
 def iter_products(feed_url: str, max_pages: int, label: str):
@@ -199,6 +241,9 @@ def send_telegram(text: str):
         if r is not None:
             print("[telegram] status/text:", r.status_code, r.text[:200])
 
+# =======================
+#    О С Н О В Н О Е
+# =======================
 def one_scan() -> int:
     sent = 0
     for feed in WB_FEED_URLS:
@@ -248,7 +293,9 @@ def one_scan() -> int:
             time.sleep(1.0)
     return sent
 
-# ===== 24/7 цикл =====
+# =======================
+#     24/7 Ц И К Л
+# =======================
 stop_flag = False
 def handle_stop(sig, frame):
     global stop_flag
