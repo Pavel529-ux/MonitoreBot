@@ -42,17 +42,24 @@ if DEBUG:
 if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and WB_FEED_URLS):
     raise SystemExit("Нужно задать TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, WB_FEED_URLS")
 
-# Заголовки под реальный браузер (RU-локаль)
-HEADERS = {
+# Заголовки под реальный браузер
+HEADERS_JSON = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
     "Origin": "https://www.wildberries.ru",
     "Referer": "https://www.wildberries.ru/",
     "Connection": "keep-alive",
+    "X-Requested-With": "XMLHttpRequest",
+}
+HEADERS_HTML = {
+    "User-Agent": HEADERS_JSON["User-Agent"],
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": HEADERS_JSON["Accept-Language"],
+    "Connection": "keep-alive",
 }
 
-# Плашка вида "80 ₽ за отзыв" (1–6 цифр: 10..100000)
+# Плашка вида "80 ₽ за отзыв"
 BONUS_RE = re.compile(r'(\d{1,6})\s*(?:₽|руб\w*|балл\w*)\s+за\s+отзыв', re.I)
 
 def _valid_proxy(url: str) -> bool:
@@ -70,7 +77,7 @@ def _wb_delay():
 # =======================
 def build_wb_session(proxy: str | None):
     s = requests.Session()
-    s.headers.update(HEADERS)
+    s.headers.update(HEADERS_JSON.copy())
     if proxy and _valid_proxy(proxy):
         s.proxies.update({"http": proxy, "https": proxy})
         print(f"[proxy] WB via {proxy.split('@')[-1]}")
@@ -83,6 +90,18 @@ _proxy_list = _split_list(PROXY_POOL)
 _current_proxy_idx = -1
 wb_session = None  # заполним ниже
 
+def prime_wb_session(session: requests.Session):
+    """Ставим реальные куки WB, чтобы API отдавал нормальные ответы."""
+    try:
+        session.get("https://www.wildberries.ru/", headers=HEADERS_HTML, timeout=20)
+        time.sleep(random.uniform(0.4, 0.8))
+        # страница поиска/каталога (generic)
+        session.get("https://www.wildberries.ru/catalog/0/search.aspx?sort=popular",
+                    headers=HEADERS_HTML, timeout=20)
+        time.sleep(random.uniform(0.4, 0.8))
+    except Exception:
+        pass  # на прайминге не валимся — это best-effort
+
 def rotate_proxy(reason=""):
     """Переключает прокси из пула. Возвращает True, если удалось переключить."""
     global wb_session, _current_proxy_idx
@@ -91,6 +110,7 @@ def rotate_proxy(reason=""):
     _current_proxy_idx = (_current_proxy_idx + 1) % len(_proxy_list)
     wb_session = build_wb_session(_proxy_list[_current_proxy_idx])
     print(f"[proxy] rotated ({reason}). now {_current_proxy_idx+1}/{len(_proxy_list)}")
+    prime_wb_session(wb_session)
     return True
 
 # Инициализация WB-сессии
@@ -102,10 +122,11 @@ else:
         print("[init] WB proxy enabled")
     elif PROXY_URL:
         print("[init] WB proxy ignored: invalid PROXY_URL")
+    prime_wb_session(wb_session)
 
 # Telegram — отдельная сессия (обычно без прокси)
 tg_session = requests.Session()
-tg_session.headers.update({"User-Agent": HEADERS["User-Agent"]})
+tg_session.headers.update({"User-Agent": HEADERS_JSON["User-Agent"]})
 if PROXY_TG_URL and _valid_proxy(PROXY_TG_URL):
     tg_session.proxies.update({"http": PROXY_TG_URL, "https": PROXY_TG_URL})
     print("[init] TG proxy enabled")
@@ -168,10 +189,9 @@ def http_json(url: str):
             print(f"[debug] http {r.status_code} {urlparse(url).netloc} len={len(r.text)}")
         if r.status_code in (429, 403, 503):
             if attempt >= WB_MAX_RETRIES:
-                # пробуем сменить прокси из пула
                 if rotate_proxy(f"{r.status_code} on {urlparse(url).path}"):
                     attempt = 0
-                    time.sleep(random.uniform(2.0, 4.0))  # пауза после смены IP
+                    time.sleep(random.uniform(2.0, 4.0))
                     continue
                 r.raise_for_status()
             wait = min(90.0, WB_BACKOFF_BASE * (2 ** attempt)) + random.uniform(0.0, 1.5)
@@ -180,17 +200,25 @@ def http_json(url: str):
             attempt += 1
             continue
         r.raise_for_status()
-        time.sleep(_wb_delay())  # темп даже при успехе
+        time.sleep(_wb_delay())
         return r.json()
+
+def referer_for_feed(_feed_url: str) -> str:
+    # «Безопасный» реферер на поисковую страницу
+    return "https://www.wildberries.ru/catalog/0/search.aspx?sort=popular"
 
 def iter_products(feed_url: str, max_pages: int, label: str):
     total = 0
+    # ставим реферер под API-вызовы
+    wb_session.headers["Referer"] = referer_for_feed(feed_url)
+
     for p in range(1, max_pages + 1):
         url = set_param(feed_url, "page", p)
 
         # РОТАЦИЯ ПРОКСИ НА СТРАНИЦЕ (включается PROXY_ROTATE_EACH_PAGE=1)
         if ROTATE_EACH_PAGE and _proxy_list:
             rotate_proxy("per-page")
+            wb_session.headers["Referer"] = referer_for_feed(feed_url)
             time.sleep(random.uniform(1.5, 3.0))
 
         data = http_json(url)
@@ -228,7 +256,7 @@ def bonus_from_json(item) -> int | None:
 def bonus_from_card_html(nm_id: int) -> int | None:
     url = f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx"
     try:
-        r = wb_session.get(url, timeout=25)
+        r = wb_session.get(url, timeout=25, headers=HEADERS_HTML)
         if r.ok:
             m = BONUS_RE.search(r.text)
             if m: return int(m.group(1))
