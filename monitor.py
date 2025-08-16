@@ -16,11 +16,14 @@ CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", "900"))
 MAX_PAGES          = int(os.getenv("MAX_PAGES", "5"))
 REDIS_URL          = os.getenv("REDIS_URL")
 
-# Прокси для WB: можно указать один PROXY_URL или пул PROXY_POOL (через |)
-PROXY_URL          = os.getenv("PROXY_URL")                 # http://user:pass@host:port или socks5h://user:pass@host:port
-PROXY_POOL         = os.getenv("PROXY_POOL", "")            # несколько прокси: "http://u:p@ip1:port|socks5h://u:p@ip2:port"
-# Отдельный прокси для Telegram (обычно НЕ нужен):
+# Прокси: либо один PROXY_URL, либо пул PROXY_POOL (через |)
+PROXY_URL          = os.getenv("PROXY_URL")
+PROXY_POOL         = os.getenv("PROXY_POOL", "")
+# Отдельный прокси для Telegram (обычно НЕ нужен)
 PROXY_TG_URL       = os.getenv("PROXY_TG_URL")
+
+# Ротация прокси на КАЖДОЙ странице (0/1)
+ROTATE_EACH_PAGE   = os.getenv("PROXY_ROTATE_EACH_PAGE", "0") == "1"
 
 DEBUG              = os.getenv("DEBUG", "1") == "1"
 
@@ -78,7 +81,7 @@ def _split_list(s: str):
 
 _proxy_list = _split_list(PROXY_POOL)
 _current_proxy_idx = -1
-wb_session = None  # заполняем ниже
+wb_session = None  # заполним ниже
 
 def rotate_proxy(reason=""):
     """Переключает прокси из пула. Возвращает True, если удалось переключить."""
@@ -184,6 +187,12 @@ def iter_products(feed_url: str, max_pages: int, label: str):
     total = 0
     for p in range(1, max_pages + 1):
         url = set_param(feed_url, "page", p)
+
+        # РОТАЦИЯ ПРОКСИ НА СТРАНИЦЕ (включается PROXY_ROTATE_EACH_PAGE=1)
+        if ROTATE_EACH_PAGE and _proxy_list:
+            rotate_proxy("per-page")
+            time.sleep(random.uniform(1.5, 3.0))
+
         data = http_json(url)
         products = (data.get("data") or {}).get("products") or []
         host = urlparse(url).netloc
