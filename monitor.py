@@ -2,24 +2,25 @@ import os, re, time, signal, traceback
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import requests
 
+# ===== Конфиг через переменные окружения =====
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 WB_FEED_URLS       = [u.strip() for u in os.getenv("WB_FEED_URLS","").split(",") if u.strip()]
 
-CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL", "600"))  # сек между циклами
-MAX_PAGES       = int(os.getenv("MAX_PAGES", "5"))
-REDIS_URL       = os.getenv("REDIS_URL")
-DEBUG           = os.getenv("DEBUG", "1") == "1"
+CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL", "600"))  # сек между циклами (по умолчанию 10 мин)
+MAX_PAGES       = int(os.getenv("MAX_PAGES", "5"))         # глубина обхода страниц
+REDIS_URL       = os.getenv("REDIS_URL")                   # опционально
+DEBUG           = os.getenv("DEBUG", "1") == "1"           # включить подробные логи
 
 if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and WB_FEED_URLS):
     raise SystemExit("Нужно задать TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, WB_FEED_URLS")
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
 
-# 1–6 цифр: покрываем от 10 до 100000 и т.п.
+# Ловим плашку вида "80 ₽ за отзыв" (любое число 1–6 знаков)
 BONUS_RE = re.compile(r'(\d{1,6})\s*(?:₽|руб\w*|балл\w*)\s+за\s+отзыв', re.I)
 
-# ===== Redis (для анти-дублей) =====
+# ===== Redis (анти-дубли) =====
 rds = None
 if REDIS_URL:
     try:
@@ -36,10 +37,10 @@ def seen_before(nm_id: int) -> bool:
     key = f"seen:{nm_id}"
     if rds:
         try:
-            if rds.get(key): 
+            if rds.get(key):
                 if DEBUG: print(f"[debug] skip duplicate nm={nm_id}")
                 return True
-            rds.set(key, "1", ex=7*24*3600)
+            rds.set(key, "1", ex=7*24*3600)  # запоминаем на 7 дней
             return False
         except Exception:
             pass
@@ -61,7 +62,7 @@ def fetch_products(feed_url: str, max_pages: int):
         r.raise_for_status()
         data = r.json()
         products = (data.get("data") or {}).get("products") or []
-        if DEBUG: print(f"[debug] feed page={p} products={len(products)} url_host={urlparse(url).netloc}")
+        if DEBUG: print(f"[debug] feed page={p} products={len(products)} host={urlparse(url).netloc}")
         if not products: break
         total += len(products)
         for item in products:
@@ -94,15 +95,25 @@ def fallback_bonus_from_card(nm_id: int):
         pass
     return None
 
+# ===== Отправка в Telegram с проверкой ответа (п.3) =====
 def send_telegram(text: str):
     api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
-    requests.post(api, json=payload, timeout=20)
+    try:
+        r = requests.post(api, json=payload, timeout=20)
+        j = r.json()
+        if not j.get("ok"):
+            print(f"[telegram] not ok: {j}")  # тут увидим 400/403 и описание
+        elif DEBUG:
+            pass  # можно печатать подтверждение при желании
+    except Exception as e:
+        print("[telegram] request failed:", e)
+        print("[telegram] status/text:", getattr(r, "status_code", "?"), getattr(r, "text", "")[:200])
 
 def one_scan() -> int:
     sent = 0
     for feed in WB_FEED_URLS:
-        if DEBUG: print(f"[debug] scan feed: {feed[:120]}...")
+        if DEBUG: print(f"[debug] scan feed: {feed[:160]}...")
         try:
             for item in fetch_products(feed, MAX_PAGES):
                 nm = item.get("id") or item.get("nmId") or item.get("nm")
@@ -118,7 +129,7 @@ def one_scan() -> int:
                 price = int(price_u) // 100 if price_u else 0
                 link = f"https://www.wildberries.ru/catalog/{nm}/detail.aspx"
 
-                # Извлекаем конкретный размер бонуса (если WB его отдаёт)
+                # Попытаемся вытащить конкретный размер бонуса
                 bonus = None
                 for key in ("promoTextCard", "promoTextCat", "description", "extended"):
                     if key in item:
@@ -130,22 +141,20 @@ def one_scan() -> int:
                 if bonus:
                     msg = f"🎯 Баллы за отзыв\n{name}\nБонус: {bonus} ₽ | Цена: {price} ₽\n{link}"
                 else:
-                    # даже если число не нашли, фид уже отфильтрован ffeedbackpoints=1 — шлём уведомление
+                    # фид уже отфильтрован ffeedbackpoints=1 — даже если число не нашли, всё равно шлём
                     msg = f"🎯 Баллы за отзыв\n{name}\nЦена: {price} ₽\n{link}"
 
-                try:
-                    send_telegram(msg)
-                    sent += 1
-                    if DEBUG: print(f"[debug] sent nm={nm}, bonus={bonus}, price={price}")
-                    time.sleep(0.4)
-                except Exception as e:
-                    print("[warn] telegram error:", e)
+                send_telegram(msg)
+                sent += 1
+                if DEBUG: print(f"[debug] sent nm={nm}, bonus={bonus}, price={price}")
+                time.sleep(0.35)  # бережём API
         except Exception as e:
             print("[warn] feed failed:", e)
             traceback.print_exc()
             time.sleep(1.0)
     return sent
 
+# ===== 24/7 цикл с корректным завершением =====
 stop_flag = False
 def handle_stop(sig, frame):
     global stop_flag
