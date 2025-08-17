@@ -1,6 +1,6 @@
 # monitor_playwright.py
 import os, re, time, json, random
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 import requests
 
 try:
@@ -19,18 +19,18 @@ WB_CATEGORY_URLS   = [u.strip() for u in (os.getenv("WB_CATEGORY_URLS", "")).spl
 HEADLESS = os.getenv("HEADLESS", "1")
 HEADLESS = False if HEADLESS in ("0", "false", "False", "no") else True
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
-MAX_SEND_PER_CYCLE = int(os.getenv("MAX_SEND_PER_CYCLE", "5"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))         # сек между циклами
+MAX_SEND_PER_CYCLE = int(os.getenv("MAX_SEND_PER_CYCLE", "5"))   # максимум отправок за цикл
 
-SCROLL_STEPS = int(os.getenv("SCROLL_STEPS", "6"))
+SCROLL_STEPS = int(os.getenv("SCROLL_STEPS", "6"))               # сколько «пролистать» страницу
 DETAIL_CHECK_LIMIT_PER_PAGE = int(os.getenv("DETAIL_CHECK_LIMIT_PER_PAGE", "60"))
 
-BONUS_MIN_PCT = float(os.getenv("BONUS_MIN_PCT", "0.5"))     # 0.5 = 50% цены
-BONUS_MIN_RUB = int(os.getenv("BONUS_MIN_RUB", "0") or "0")  # фикс минимум в ₽ (0 = не использовать)
+BONUS_MIN_PCT = float(os.getenv("BONUS_MIN_PCT", "0.5"))         # 0.5 = 50%
+BONUS_MIN_RUB = int(os.getenv("BONUS_MIN_RUB", "0") or "0")      # фикс минимум в ₽
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
-PROXY_URL = os.getenv("PROXY_URL", "").strip()  # http://user:pass@host:port
+PROXY_URL = os.getenv("PROXY_URL", "").strip()                   # http://user:pass@host:port
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 
 # ========= REDIS (anti-dup) =========
@@ -44,7 +44,8 @@ if REDIS_URL and redis_lib:
         print("[warn] Redis disabled:", e)
         r = None
 
-SEEN_TTL = 60 * 60 * 24 * 14  # 14 дней
+_mem = set()                 # запасной антидубль на время процесса
+SEEN_TTL = 60*60*24*14       # 14 дней
 
 def seen_before(nm: int) -> bool:
     key = f"wb:sent:{nm}"
@@ -56,15 +57,14 @@ def seen_before(nm: int) -> bool:
             return False
     except Exception:
         pass
-    # fallback in-memory per run
+    if nm in _mem:  # in-memory
+        return True
     _mem.add(nm)
     return False
 
-_mem = set()
-
-# ========= HELPERS =========
+# ========= UTILS =========
 def digits(s: str) -> int:
-    m = re.findall(r"\d+", s.replace("\u00a0"," "))
+    m = re.findall(r"\d+", (s or "").replace("\u00a0", " "))
     return int("".join(m)) if m else 0
 
 def product_link(nm: int) -> str:
@@ -72,14 +72,14 @@ def product_link(nm: int) -> str:
 
 def tg_send(text: str):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        print("Нужно задать TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
+        print("Нужно задать TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID")
         return
     api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False
+        "disable_web_page_preview": False,
     }
     try:
         r = requests.post(api, json=payload, timeout=25)
@@ -96,114 +96,125 @@ def pass_bonus_rule(bonus: int, price: int) -> bool:
     return bonus >= need
 
 def parse_products_from_json_payload(payload) -> list:
-    """
-    Собираем из различных вариантов WB: либо {"data":{"products":[...]}} либо списки.
-    Возвращаем список словарей с ключами nm, price, name (если есть).
-    """
+    """ Извлекаем продукты из разных форм WB JSON. """
     out = []
     try:
-        # варианты структур
         candidates = []
         if isinstance(payload, dict):
-            if "data" in payload and isinstance(payload["data"], dict):
-                if "products" in payload["data"]:
-                    candidates = payload["data"]["products"]
-                elif isinstance(payload["data"].get("products"), list):
-                    candidates = payload["data"]["products"]
-            if not candidates and "products" in payload and isinstance(payload["products"], list):
+            d = payload.get("data")
+            if isinstance(d, dict) and isinstance(d.get("products"), list):
+                candidates = d["products"]
+            elif isinstance(payload.get("products"), list):
                 candidates = payload["products"]
         elif isinstance(payload, list):
-            # иногда весь ответ - список
             for el in payload:
-                if isinstance(el, dict) and "data" in el:
-                    d = el.get("data") or {}
-                    if isinstance(d, dict) and "products" in d:
-                        candidates.extend(d.get("products") or [])
+                if isinstance(el, dict) and isinstance(el.get("data"), dict) and isinstance(el["data"].get("products"), list):
+                    candidates.extend(el["data"]["products"])
+
         for p in candidates:
-            nm = p.get("id") or p.get("nm") or p.get("nm_id") or p.get("nmId") or 0
+            nm = p.get("id") or p.get("nm") or p.get("nmId") or p.get("nm_id") or 0
             if not nm:
                 continue
             price = 0
-            # цена бывает в разных полях (rubPrice, priceU/100 и пр.)
             if isinstance(p.get("priceU"), int):
-                price = int(p.get("priceU")) // 100
+                price = int(p["priceU"]) // 100
             elif isinstance(p.get("salePriceU"), int):
-                price = int(p.get("salePriceU")) // 100
+                price = int(p["salePriceU"]) // 100
             elif p.get("price"):
-                price = digits(str(p.get("price")))
-            name = p.get("name") or p.get("brand") or ""
-            out.append({"nm": int(nm), "price": int(price), "name": name})
+                price = digits(str(p["price"]))
+            out.append({"nm": int(nm), "price": int(price), "name": p.get("name") or p.get("brand") or ""})
     except Exception as e:
         if DEBUG: print("[json-parse] err:", e)
     return out
 
 def try_close_popups(page):
-    # закрываем возможные попапы куки/региона
     selectors = [
-        "button:has-text('Понятно')",
-        "button:has-text('Хорошо')",
-        "button:has-text('Согласен')",
-        "button:has-text('Сохранить')",
-        "button:has-text('Да')",
-        "button:has-text('Ок')",
-        "button:has-text('Принять')"
+        "button:has-text('Понятно')","button:has-text('Хорошо')","button:has-text('Согласен')",
+        "button:has-text('Сохранить')","button:has-text('Да')","button:has-text('Ок')","button:has-text('Принять')",
     ]
     for sel in selectors:
         try:
-            el = page.locator(sel)
-            if el.first.is_visible(timeout=500):
-                el.first.click(timeout=500)
-                time.sleep(0.2)
+            page.locator(sel).first.click(timeout=400)
+            time.sleep(0.1)
         except Exception:
             pass
 
-def extract_bonus_from_text(text: str) -> int:
-    # варианты: "80 ₽ за отзыв", "80Р за отзыв"
-    m = re.search(r"(\d{2,6})\s*[₽Р]\s*за\s*отзыв", text, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    # Иногда пишут "баллы за отзыв" — укажем ₽ в сообщении, но тут всё равно число
-    m = re.search(r"балл[а-я]*\s+за\s+отзыв[^0-9]*(\d{2,6})", text, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    return 0
+def open_page_with_retries(context, url: str, max_retries: int = 3):
+    """Открыть страницу с ретраями; вернуть page или None."""
+    backoff = 2.0
+    for i in range(1, max_retries + 1):
+        page = context.new_page()
+        page.set_default_timeout(15000)
+        page.set_default_navigation_timeout(15000)
+        try:
+            print("[open]", url)
+            page.goto(url, wait_until="domcontentloaded")
+            try:
+                page.wait_for_load_state("networkidle", timeout=12000)
+            except Exception:
+                pass
+            try_close_popups(page)
+            return page
+        except PlaywrightTimeoutError:
+            if DEBUG: print(f"[warn] timeout on open (attempt {i}/{max_retries})")
+        except Exception as e:
+            if DEBUG: print(f"[warn] open error (attempt {i}/{max_retries}):", e)
+        try:
+            page.close()
+        except Exception:
+            pass
+        time.sleep(backoff)
+        backoff *= 1.6
+    return None
+
+def safe_scroll(page, steps: int):
+    """Плавная безопасная прокрутка (без падения на пустом body)."""
+    for _ in range(max(1, steps)):
+        try:
+            page.evaluate(
+                """
+                () => {
+                  const root = document.scrollingElement || document.body || document.documentElement;
+                  if (!root) return 0;
+                  window.scrollBy(0, root.scrollHeight);
+                  return root.scrollHeight || 0;
+                }
+                """
+            )
+        except Exception:
+            time.sleep(0.6)
+        time.sleep(0.6)
+        try_close_popups(page)
 
 def capture_products_on_page(page) -> list:
-    """
-    Собираем товары из XHR ответов + по плиткам (id).
-    """
+    """ Собираем товары из XHR + data-nm-id на плитках. """
     captured_json = []
-    products = []
 
     def on_response(res):
         try:
-            url = res.url
             ct = res.headers.get("content-type", "")
-            if ("application/json" in ct) and ("/catalog" in url or "/search" in url):
-                data = res.json()
-                captured_json.extend(parse_products_from_json_payload(data))
+            if "application/json" in ct:
+                url = res.url
+                if ("/catalog" in url) or ("/search" in url):
+                    data = res.json()
+                    captured_json.extend(parse_products_from_json_payload(data))
         except Exception:
             pass
 
     page.on("response", on_response)
-    # ждём базовую загрузку
-    try_close_popups(page)
     time.sleep(0.8)
+    try_close_popups(page)
 
-    # прокрутка
-    for _ in range(max(1, SCROLL_STEPS)):
-        page.evaluate("window.scrollBy(0, document.body.scrollHeight);")
-        time.sleep(random.uniform(0.5, 1.1))
-        try_close_popups(page)
+    safe_scroll(page, SCROLL_STEPS)
 
-    # плитки на странице (fallback на случай, если XHR не поймался)
     tiles = []
     try:
         tiles = page.locator("[data-nm-id]").all()
     except Exception:
         tiles = []
+
     nm_from_tiles = []
-    for t in tiles[:500]:
+    for t in tiles[:600]:
         try:
             nm = int(t.get_attribute("data-nm-id") or "0")
             if nm:
@@ -211,7 +222,6 @@ def capture_products_on_page(page) -> list:
         except Exception:
             pass
 
-    # склейка
     by_nm = {}
     for p in captured_json:
         by_nm[p["nm"]] = {"nm": p["nm"], "price": p.get("price", 0), "name": p.get("name","")}
@@ -224,10 +234,16 @@ def capture_products_on_page(page) -> list:
 
     return list(by_nm.values())
 
+def extract_bonus_from_text(text: str) -> int:
+    m = re.search(r"(\d{2,6})\s*[₽Р]\s*за\s*отзыв", text or "", re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"балл[а-я]*\s+за\s+отзыв[^0-9]*(\d{2,6})", text or "", re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    return 0
+
 def probe_detail(context, nm: int) -> dict:
-    """
-    Открываем карточку и пытаемся вытащить цену и бонус.
-    """
     url = product_link(nm)
     page = context.new_page()
     page.set_default_timeout(8000)
@@ -238,36 +254,29 @@ def probe_detail(context, nm: int) -> dict:
         page.goto(url, wait_until="domcontentloaded")
         try_close_popups(page)
         time.sleep(0.6)
-
-        # имя / заголовок
         try:
             name = page.locator("h1").first.inner_text(timeout=2000).strip()
         except Exception:
             name = ""
 
-        # цена: чаще всего "final-price" или aria-label
         texts = []
+        for sel in (
+            '[data-link="text{:product_card_price}"]',
+            ".price-block__final-price",
+        ):
+            try:
+                txt = page.locator(sel).first.inner_text(timeout=1500)
+                texts.append(txt)
+            except Exception:
+                pass
         try:
-            txt = page.locator('[data-link="text{:product_card_price}"]').first.inner_text(timeout=1500)
-            texts.append(txt)
+            texts.append(page.locator("body").inner_text(timeout=2000))
         except Exception:
             pass
-        try:
-            txt = page.locator(".price-block__final-price").first.inner_text(timeout=1500)
-            texts.append(txt)
-        except Exception:
-            pass
-        try:
-            txt = page.locator("body").inner_text(timeout=2000)
-            texts.append(txt)
-        except Exception:
-            pass
-
         for t in texts:
             if not price:
                 price = digits(t)
 
-        # бонус по тексту страницы
         bigtxt = ""
         try:
             bigtxt = page.locator("body").inner_text(timeout=2000)
@@ -286,78 +295,67 @@ def probe_detail(context, nm: int) -> dict:
             pass
     return {"nm": nm, "price": price, "bonus": bonus, "name": name}
 
+def build_pw_proxy(proxy_url: str):
+    if not proxy_url:
+        return None
+    try:
+        u = urlparse(proxy_url)
+        server = f"{u.scheme or 'http'}://{u.hostname}:{u.port}"
+        out = {"server": server}
+        if u.username:
+            out["username"] = u.username
+        if u.password:
+            out["password"] = u.password
+        return out
+    except Exception:
+        return None
+
 def scan_once() -> int:
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and WB_CATEGORY_URLS):
         print("Нужно задать TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID и WB_CATEGORY_URLS")
         return 0
 
-    pct_info = int(BONUS_MIN_PCT * 100)
-    rub_info = f", или ≥ {BONUS_MIN_RUB}₽" if BONUS_MIN_RUB > 0 else ""
     if DEBUG:
+        pct_info = int(BONUS_MIN_PCT * 100)
+        rub_info = f", или ≥ {BONUS_MIN_RUB}₽" if BONUS_MIN_RUB > 0 else ""
         print(f"[start] Playwright monitor — categories mode (лимит {MAX_SEND_PER_CYCLE} шт/цикл, пауза {CHECK_INTERVAL//60} минут, бонус ≥ {pct_info}% цены{rub_info})")
 
     sent = 0
-
     with sync_playwright() as p:
-        launch_kwargs = dict(headless=HEADLESS, args=["--disable-dev-shm-usage"])
-        browser = p.chromium.launch(**launch_kwargs)
-
+        browser = p.chromium.launch(headless=HEADLESS, args=["--disable-dev-shm-usage"])
         context_kwargs = {}
-        if PROXY_URL:
-            context_kwargs["proxy"] = {"server": PROXY_URL}
+        pw_proxy = build_pw_proxy(PROXY_URL)
+        if pw_proxy:
+            context_kwargs["proxy"] = pw_proxy
         context = browser.new_context(**context_kwargs)
 
         for url in WB_CATEGORY_URLS:
             if sent >= MAX_SEND_PER_CYCLE:
                 break
 
-            page = context.new_page()
-            page.set_default_timeout(10000)
-            try:
-                print("[open]", url)
-                page.goto(url, wait_until="domcontentloaded")
-            except PlaywrightTimeoutError:
-                if DEBUG: print("[warn] timeout on open")
-            except Exception as e:
-                if DEBUG: print("[warn] open error:", e)
-
-            try_close_popups(page)
+            page = open_page_with_retries(context, url, max_retries=3)
+            if not page:
+                if DEBUG: print("[warn] skip url after retries:", url)
+                continue
 
             products_basic = capture_products_on_page(page)
-
-            # ограничим количество детальных проверок на страницу
             to_probe = products_basic[:DETAIL_CHECK_LIMIT_PER_PAGE]
 
             for pr in to_probe:
                 if sent >= MAX_SEND_PER_CYCLE:
                     break
-
                 nm = pr["nm"]
-                if nm in _mem or (r and r.get(f"wb:sent:{nm}")):
+                if seen_before(nm):
                     continue
 
-                # если уже есть цена и бонус — ок; иначе идём в деталь
                 price = pr.get("price", 0)
-                bonus = 0
-
-                # деталь
                 detail = probe_detail(context, nm)
                 if not price:
                     price = detail.get("price", 0)
-                bonus = max(bonus, detail.get("bonus", 0))
+                bonus = detail.get("bonus", 0)
                 name  = detail.get("name") or pr.get("name") or ""
 
                 if bonus and price and pass_bonus_rule(bonus, price):
-                    # антидубль
-                    if r:
-                        if r.get(f"wb:sent:{nm}"):
-                            continue
-                        r.setex(f"wb:sent:{nm}", SEEN_TTL, "1")
-                    elif nm in _mem:
-                        continue
-                    else:
-                        _mem.add(nm)
-
                     msg = (
                         f"🍒 <b>Баллы за отзыв</b>\n"
                         f"{name.strip()}\n"
@@ -367,7 +365,7 @@ def scan_once() -> int:
                     )
                     tg_send(msg)
                     sent += 1
-                    time.sleep(0.7)  # чуть разгрузим Telegram
+                    time.sleep(0.7)
 
             try:
                 page.close()
@@ -375,8 +373,7 @@ def scan_once() -> int:
                 pass
 
         try:
-            context.close()
-            browser.close()
+            context.close(); browser.close()
         except Exception:
             pass
 
@@ -384,7 +381,6 @@ def scan_once() -> int:
 
 
 if __name__ == "__main__":
-    # приветствие один раз при старте (не спамим в цикле)
     pct_info = int(BONUS_MIN_PCT * 100)
     rub_info = f", или ≥ {BONUS_MIN_RUB}₽" if BONUS_MIN_RUB > 0 else ""
     tg_send(f"✅ Монитор запущен (лимит {MAX_SEND_PER_CYCLE}/цикл, пауза {CHECK_INTERVAL//60} мин, бонус ≥ {pct_info}%{rub_info})")
@@ -394,10 +390,8 @@ if __name__ == "__main__":
             n = scan_once()
             print(f"[cycle] Done. Sent: {n}")
         except KeyboardInterrupt:
-            print("[stop] Exit by user")
-            break
+            print("[stop] Exit by user"); break
         except Exception as e:
             print("[error] cycle:", e)
-        # Пауза между циклами
         time.sleep(max(5, CHECK_INTERVAL))
 
