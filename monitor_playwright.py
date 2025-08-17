@@ -22,7 +22,7 @@ HEADLESS = False if HEADLESS in ("0", "false", "False", "no") else True
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))         # сек между циклами
 MAX_SEND_PER_CYCLE = int(os.getenv("MAX_SEND_PER_CYCLE", "5"))   # максимум отправок за цикл
 
-SCROLL_STEPS = int(os.getenv("SCROLL_STEPS", "6"))
+SCROLL_STEPS = int(os.getenv("SCROLL_STEPS", "6"))               # сколько «пролистать» страницу
 DETAIL_CHECK_LIMIT_PER_PAGE = int(os.getenv("DETAIL_CHECK_LIMIT_PER_PAGE", "60"))
 
 BONUS_MIN_PCT = float(os.getenv("BONUS_MIN_PCT", "0.5"))         # 0.5 = 50%
@@ -30,7 +30,7 @@ BONUS_MIN_RUB = int(os.getenv("BONUS_MIN_RUB", "0") or "0")      # фикс ми
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
-PROXY_URL = os.getenv("PROXY_URL", "").strip()                   # http://user:pass@host:port
+PROXY_URL = os.getenv("PROXY_URL", "").strip()                   # http://user:pass@host:port  или socks5://...
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 
 # ========= REDIS (anti-dup) =========
@@ -45,28 +45,28 @@ if REDIS_URL and redis_lib:
         r = None
 
 _mem = set()
-SEEN_TTL = 60*60*24*14
+SEEN_TTL = 60*60*24*14  # 14 дней
 
-def seen_before(nm: int) -> bool:
+def already_sent(nm: int) -> bool:
     key = f"wb:sent:{nm}"
     try:
         if r:
-            if r.get(key):
-                return True
-            r.setex(key, SEEN_TTL, "1")
-            return False
+            return bool(r.get(key))
     except Exception:
         pass
-    if nm in _mem:
-        return True
+    return nm in _mem
+
+def mark_sent(nm: int):
+    key = f"wb:sent:{nm}"
+    try:
+        if r:
+            r.setex(key, SEEN_TTL, "1")
+            return
+    except Exception:
+        pass
     _mem.add(nm)
-    return False
 
 # ========= UTILS =========
-def digits(s: str) -> int:
-    m = re.findall(r"\d+", (s or "").replace("\u00a0", " "))
-    return int("".join(m)) if m else 0
-
 def product_link(nm: int) -> str:
     return f"https://www.wildberries.ru/catalog/{nm}/detail.aspx"
 
@@ -77,9 +77,9 @@ def tg_send(text: str):
     api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False}
     try:
-        r = requests.post(api, json=payload, timeout=25)
-        if r.status_code != 200 and DEBUG:
-            print("[telegram]", r.status_code, r.text[:200])
+        r0 = requests.post(api, json=payload, timeout=25)
+        if r0.status_code != 200 and DEBUG:
+            print("[telegram]", r0.status_code, r0.text[:200])
     except Exception as e:
         print("[telegram] error:", e)
 
@@ -91,6 +91,7 @@ def pass_bonus_rule(bonus: int, price: int) -> bool:
     return bonus >= need
 
 def parse_products_from_json_payload(payload) -> list:
+    """ Извлекаем товары из разных WB JSON. """
     out = []
     try:
         candidates = []
@@ -115,7 +116,8 @@ def parse_products_from_json_payload(payload) -> list:
             elif isinstance(p.get("salePriceU"), int):
                 price = int(p["salePriceU"]) // 100
             elif p.get("price"):
-                price = digits(str(p["price"]))
+                # тут JSON уже рубли, но всё же аккуратно
+                price = extract_price_from_text(str(p["price"]))
             out.append({"nm": int(nm), "price": int(price), "name": p.get("name") or p.get("brand") or ""})
     except Exception as e:
         if DEBUG: print("[json-parse] err:", e)
@@ -138,12 +140,10 @@ def open_page_with_retries(context, url: str, max_retries: int = 3):
     backoff = 3.0
     for i in range(1, max_retries + 1):
         page = context.new_page()
-        # подлиннее таймауты — WB с прокси может открываться долго
         page.set_default_timeout(35000)
         page.set_default_navigation_timeout(35000)
         try:
             print("[open]", url)
-            # ждём хотя бы domcontentloaded; networkidle не обязательно наступает
             page.goto(url, wait_until="domcontentloaded")
             try:
                 page.wait_for_load_state("load", timeout=18000)
@@ -230,6 +230,23 @@ def capture_products_on_page(page) -> list:
 
     return list(by_nm.values())
 
+def extract_price_from_text(text: str) -> int:
+    """
+    Достаём цену только из выражений с ₽ или 'руб'.
+    Берём первую правдоподобную (>0 и < 10 млн).
+    """
+    if not text:
+        return 0
+    for m in re.finditer(r"(\d[\d\s]{0,8})\s*(?:₽|руб\.?|р\.)", text, flags=re.IGNORECASE):
+        num = re.sub(r"\s+", "", m.group(1))
+        try:
+            val = int(num)
+            if 0 < val < 10_000_000:
+                return val
+        except Exception:
+            pass
+    return 0
+
 def extract_bonus_from_text(text: str) -> int:
     m = re.search(r"(\d{2,6})\s*[₽Р]\s*за\s*отзыв", text or "", re.IGNORECASE)
     if m:
@@ -242,40 +259,64 @@ def extract_bonus_from_text(text: str) -> int:
 def probe_detail(context, nm: int) -> dict:
     url = product_link(nm)
     page = context.new_page()
-    page.set_default_timeout(9000)
+    page.set_default_timeout(15000)  # WB может грузиться долго
     price = 0
     bonus = 0
     name  = ""
     try:
         page.goto(url, wait_until="domcontentloaded")
+        try:
+            page.wait_for_load_state("load", timeout=12000)
+        except Exception:
+            pass
         try_close_popups(page)
         time.sleep(0.6)
+
+        # 1) Название
         try:
             name = page.locator("h1").first.inner_text(timeout=2500).strip()
         except Exception:
             name = ""
 
+        # 2) Цена — несколько селекторов + фолбэк body (ищем только ₽/руб)
         texts = []
-        for sel in ('[data-link="text{:product_card_price}"]', ".price-block__final-price"):
+        for sel in (
+            '[data-link="text{:product_card_price}"]',
+            ".price-block__final-price",
+            ".price-block__price",
+            '[data-qa="product-price"]',
+        ):
             try:
-                txt = page.locator(sel).first.inner_text(timeout=1500)
-                texts.append(txt)
+                txt = page.locator(sel).first.inner_text(timeout=1800)
+                if txt:
+                    texts.append(txt)
             except Exception:
                 pass
         try:
-            texts.append(page.locator("body").inner_text(timeout=2500))
+            texts.append(page.locator("body").inner_text(timeout=3000))
         except Exception:
             pass
+
         for t in texts:
             if not price:
-                price = digits(t)
+                p = extract_price_from_text(t)
+                if p:
+                    price = p
 
-        bigtxt = ""
+        # 3) Бонус — из всего текста страницы (ищем «₽ за отзыв»)
         try:
             bigtxt = page.locator("body").inner_text(timeout=2500)
+            bonus = extract_bonus_from_text(bigtxt)
         except Exception:
             pass
-        bonus = extract_bonus_from_text(bigtxt)
+
+        # 4) Фолбэк: aria-label кнопки с ценой
+        if not price:
+            try:
+                aria = page.locator('button[aria-label*="₽"]').first.get_attribute("aria-label")
+                price = extract_price_from_text(aria)
+            except Exception:
+                pass
 
         if DEBUG:
             print(f"[detail] nm={nm} price={price} bonus={bonus} name={name[:40]}")
@@ -288,12 +329,37 @@ def probe_detail(context, nm: int) -> dict:
             pass
     return {"nm": nm, "price": price, "bonus": bonus, "name": name}
 
+def proxy_selftest(proxy_url: str) -> bool:
+    """Проверяем, что через указанный прокси вообще есть интернет."""
+    if not proxy_url:
+        return True
+    try:
+        proxies = {"http": proxy_url, "https": proxy_url}
+        r0 = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=10)
+        ok = r0.ok
+        ip = ""
+        try:
+            ip = r0.json().get("ip")
+        except Exception:
+            pass
+        print(f"[proxy] self-test status={r0.status_code} ip={ip}")
+        return ok
+    except Exception as e:
+        print("[proxy] self-test failed:", e)
+        return False
+
 def build_pw_proxy(proxy_url: str):
     if not proxy_url:
         return None
     try:
         u = urlparse(proxy_url)
-        server = f"{u.scheme or 'http'}://{u.hostname}:{u.port}"
+        scheme = (u.scheme or "http").lower()
+        # normalize socks5h -> socks5
+        if scheme in ("socks5h", "socks5", "socks"):
+            scheme = "socks5"
+        elif scheme not in ("http", "https"):
+            scheme = "http"
+        server = f"{scheme}://{u.hostname}:{u.port}"
         out = {"server": server}
         if u.username:
             out["username"] = u.username
@@ -343,8 +409,8 @@ def make_context(p, proxy_url: str, headless: bool):
 
     # режем тяжёлые ресурсы (ускоряет и уменьшает шум)
     def _route(route):
-        r = route.request
-        if r.resource_type in ("image", "media", "font"):
+        r1 = route.request
+        if r1.resource_type in ("image", "media", "font"):
             return route.abort()
         return route.continue_()
     context.route("**/*", _route)
@@ -363,7 +429,12 @@ def scan_once() -> int:
 
     sent = 0
     with sync_playwright() as p:
-        browser, context = make_context(p, PROXY_URL, HEADLESS)
+        use_proxy = PROXY_URL
+        if PROXY_URL and not proxy_selftest(PROXY_URL):
+            print("[proxy] disabled for this cycle (self-test failed)")
+            use_proxy = ""  # работаем без прокси в этом цикле, чтобы не висеть
+
+        browser, context = make_context(p, use_proxy, HEADLESS)
 
         for url in WB_CATEGORY_URLS:
             if sent >= MAX_SEND_PER_CYCLE:
@@ -381,7 +452,7 @@ def scan_once() -> int:
                 if sent >= MAX_SEND_PER_CYCLE:
                     break
                 nm = pr["nm"]
-                if seen_before(nm):
+                if already_sent(nm):
                     continue
 
                 price = pr.get("price", 0)
@@ -400,6 +471,7 @@ def scan_once() -> int:
                         f"{product_link(nm)}"
                     )
                     tg_send(msg)
+                    mark_sent(nm)
                     sent += 1
                     time.sleep(0.7)
 
@@ -430,4 +502,3 @@ if __name__ == "__main__":
         except Exception as e:
             print("[error] cycle:", e)
         time.sleep(max(5, CHECK_INTERVAL))
-
