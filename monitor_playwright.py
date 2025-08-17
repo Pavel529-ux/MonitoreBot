@@ -1,504 +1,323 @@
-# monitor_playwright.py
-import os, re, time, json, random
-from urllib.parse import urlparse
+import os, re, time, random, json, math
+from contextlib import contextmanager
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+
 import requests
+import redis
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-try:
-    import redis as redis_lib
-except Exception:
-    redis_lib = None
+# -------------------- ENV --------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+WB_CATEGORY_URLS   = os.getenv("WB_CATEGORY_URLS", "").strip()
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+# Лимиты и пороги
+MAX_SEND_PER_CYCLE          = int(os.getenv("MAX_SEND_PER_CYCLE", "5"))
+CHECK_INTERVAL              = int(os.getenv("CHECK_INTERVAL", "300"))  # секунд между циклами
+BONUS_MIN_PCT               = float(os.getenv("BONUS_MIN_PCT", "0"))   # 0.5 = 50%
+BONUS_MIN_RUB               = int(os.getenv("BONUS_MIN_RUB", "0"))     # абсолютный минимум, руб
+DETAIL_CHECK_LIMIT_PER_PAGE = int(os.getenv("DETAIL_CHECK_LIMIT_PER_PAGE", "40"))  # сколько детальных карточек открывать с одной страницы
+MAX_PAGES                   = int(os.getenv("MAX_PAGES", "5"))         # страниц каталога на URL
 
-# ========= ENV =========
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+# Поведение Playwright
+HEADLESS         = os.getenv("HEADLESS", "1") not in ("0", "false", "False")
+SCROLL_STEPS     = int(os.getenv("SCROLL_STEPS", "6"))
+WB_MAX_RETRIES   = int(os.getenv("WB_MAX_RETRIES", "2"))
+WB_PAGE_DELAY_MIN= float(os.getenv("WB_PAGE_DELAY_MIN", "0.9"))
+WB_PAGE_DELAY_MAX= float(os.getenv("WB_PAGE_DELAY_MAX", "1.6"))
 
-WB_CATEGORY_URLS   = [u.strip() for u in (os.getenv("WB_CATEGORY_URLS", "")).split("|") if u.strip()]
+# Прокси (HTTP для браузера)
+PROXY_URL = (os.getenv("PROXY_URL") or "").strip()  # пример: http://user:pass@host:port
 
-HEADLESS = os.getenv("HEADLESS", "1")
-HEADLESS = False if HEADLESS in ("0", "false", "False", "no") else True
+# Redis для дедупликации
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+rdb = redis.Redis.from_url(REDIS_URL)
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))         # сек между циклами
-MAX_SEND_PER_CYCLE = int(os.getenv("MAX_SEND_PER_CYCLE", "5"))   # максимум отправок за цикл
+DEBUG = os.getenv("DEBUG", "0") in ("1", "true", "True")
 
-SCROLL_STEPS = int(os.getenv("SCROLL_STEPS", "6"))               # сколько «пролистать» страницу
-DETAIL_CHECK_LIMIT_PER_PAGE = int(os.getenv("DETAIL_CHECK_LIMIT_PER_PAGE", "60"))
+def dprint(*a):
+    if DEBUG:
+        print(*a)
 
-BONUS_MIN_PCT = float(os.getenv("BONUS_MIN_PCT", "0.5"))         # 0.5 = 50%
-BONUS_MIN_RUB = int(os.getenv("BONUS_MIN_RUB", "0") or "0")      # фикс минимум в ₽
-
-DEBUG = os.getenv("DEBUG", "0") == "1"
-
-PROXY_URL = os.getenv("PROXY_URL", "").strip()                   # http://user:pass@host:port  или socks5://...
-REDIS_URL = os.getenv("REDIS_URL", "").strip()
-
-# ========= REDIS (anti-dup) =========
-r = None
-if REDIS_URL and redis_lib:
-    try:
-        r = redis_lib.Redis.from_url(REDIS_URL, socket_timeout=5, decode_responses=True)
-        r.ping()
-        if DEBUG: print("[init] Redis OK")
-    except Exception as e:
-        print("[warn] Redis disabled:", e)
-        r = None
-
-_mem = set()
-SEEN_TTL = 60*60*24*14  # 14 дней
-
-def already_sent(nm: int) -> bool:
-    key = f"wb:sent:{nm}"
-    try:
-        if r:
-            return bool(r.get(key))
-    except Exception:
-        pass
-    return nm in _mem
-
-def mark_sent(nm: int):
-    key = f"wb:sent:{nm}"
-    try:
-        if r:
-            r.setex(key, SEEN_TTL, "1")
-            return
-    except Exception:
-        pass
-    _mem.add(nm)
-
-# ========= UTILS =========
-def product_link(nm: int) -> str:
-    return f"https://www.wildberries.ru/catalog/{nm}/detail.aspx"
-
-def tg_send(text: str):
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+# -------------------- TG helpers --------------------
+def tg_send(text, preview=True):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Нужно задать TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID")
         return
-    api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False}
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": not preview,
+        "parse_mode": "HTML",
+    }
     try:
-        r0 = requests.post(api, json=payload, timeout=25)
-        if r0.status_code != 200 and DEBUG:
-            print("[telegram]", r0.status_code, r0.text[:200])
+        requests.post(url, json=payload, timeout=20)
     except Exception as e:
         print("[telegram] error:", e)
 
-def pass_bonus_rule(bonus: int, price: int) -> bool:
-    need_pct = int(price * BONUS_MIN_PCT) if price and price > 0 else 0
-    need = max(BONUS_MIN_RUB, need_pct)
-    if DEBUG:
-        print(f"[rule] price={price} bonus={bonus} need={need} (pct={need_pct}, min_rub={BONUS_MIN_RUB}) -> {bonus >= need}")
-    return bonus >= need
+def fmt_banner():
+    pct = f"{int(BONUS_MIN_PCT*100)}%" if BONUS_MIN_PCT>0 else "0%"
+    rub = f"{BONUS_MIN_RUB}₽" if BONUS_MIN_RUB>0 else "0₽"
+    return f"✅ Монитор запущен (лимит {MAX_SEND_PER_CYCLE}/цикл, пауза {CHECK_INTERVAL//60} мин, бонус ≥ {pct}, или ≥ {rub})"
 
-def parse_products_from_json_payload(payload) -> list:
-    """ Извлекаем товары из разных WB JSON. """
-    out = []
+def fmt_item(name, price, bonus, url):
+    price_s = f"{price:,}".replace(",", " ")
+    bonus_s = f"{bonus:,}".replace(",", " ")
+    return (f"🍒 <b>Балл(ы) за отзыв</b>\n"
+            f"{name}\n"
+            f"Цена: <b>{price_s} ₽</b>\n"
+            f"Бонус: <b>{bonus_s} ₽</b>\n"
+            f"{url}")
+
+# -------------------- utils --------------------
+def normalize_url(u: str) -> str:
+    """Добавляем ffeedbackpoints=1, если нет; нормализуем параметр page."""
     try:
-        candidates = []
-        if isinstance(payload, dict):
-            d = payload.get("data")
-            if isinstance(d, dict) and isinstance(d.get("products"), list):
-                candidates = d["products"]
-            elif isinstance(payload.get("products"), list):
-                candidates = payload["products"]
-        elif isinstance(payload, list):
-            for el in payload:
-                if isinstance(el, dict) and isinstance(el.get("data"), dict) and isinstance(el["data"].get("products"), list):
-                    candidates.extend(el["data"]["products"])
+        pr = urlparse(u)
+        q = parse_qs(pr.query)
+        if "ffeedbackpoints" not in q:
+            q["ffeedbackpoints"] = ["1"]
+        if "page" not in q:
+            q["page"] = ["1"]
+        new_q = urlencode({k:v[0] for k,v in q.items()})
+        return urlunparse(pr._replace(query=new_q))
+    except:
+        return u
 
-        for p in candidates:
-            nm = p.get("id") or p.get("nm") or p.get("nmId") or p.get("nm_id") or 0
-            if not nm:
-                continue
-            price = 0
-            if isinstance(p.get("priceU"), int):
-                price = int(p["priceU"]) // 100
-            elif isinstance(p.get("salePriceU"), int):
-                price = int(p["salePriceU"]) // 100
-            elif p.get("price"):
-                # тут JSON уже рубли, но всё же аккуратно
-                price = extract_price_from_text(str(p["price"]))
-            out.append({"nm": int(nm), "price": int(price), "name": p.get("name") or p.get("brand") or ""})
-    except Exception as e:
-        if DEBUG: print("[json-parse] err:", e)
-    return out
+def need_send(price: int, bonus: int) -> bool:
+    need_rub = max(int(math.ceil(price * BONUS_MIN_PCT)), BONUS_MIN_RUB)
+    return bonus >= need_rub
 
-def try_close_popups(page):
-    selectors = [
-        "button:has-text('Понятно')","button:has-text('Хорошо')","button:has-text('Согласен')",
-        "button:has-text('Сохранить')","button:has-text('Да')","button:has-text('Ок')","button:has-text('Принять')",
-    ]
-    for sel in selectors:
+@contextmanager
+def browser_ctx(pw):
+    args = {}
+    if PROXY_URL:
+        # playwright ждёт dict proxy={"server":"http://host:port","username":"u","password":"p"}
+        # разберём вручную
         try:
-            page.locator(sel).first.click(timeout=400)
-            time.sleep(0.1)
-        except Exception:
-            pass
-
-def open_page_with_retries(context, url: str, max_retries: int = 3):
-    """Открыть страницу с ретраями; вернуть page или None."""
-    backoff = 3.0
-    for i in range(1, max_retries + 1):
-        page = context.new_page()
-        page.set_default_timeout(35000)
-        page.set_default_navigation_timeout(35000)
-        try:
-            print("[open]", url)
-            page.goto(url, wait_until="domcontentloaded")
-            try:
-                page.wait_for_load_state("load", timeout=18000)
-            except Exception:
-                pass
-            try_close_popups(page)
-            return page
-        except PlaywrightTimeoutError:
-            if DEBUG: print(f"[warn] timeout on open (attempt {i}/{max_retries})")
+            pr = urlparse(PROXY_URL)
+            server = f"{pr.scheme}://{pr.hostname}:{pr.port}"
+            proxy = {"server": server}
+            if pr.username or pr.password:
+                if pr.username: proxy["username"] = pr.username
+                if pr.password: proxy["password"] = pr.password
+            args["proxy"] = proxy
+            print(f"[proxy] using {server}")
         except Exception as e:
-            if DEBUG: print(f"[warn] open error (attempt {i}/{max_retries}):", e)
-        try:
-            page.close()
-        except Exception:
-            pass
-        time.sleep(backoff)
-        backoff *= 1.6
-    return None
+            print("[proxy] parse error:", e)
 
-def safe_scroll(page, steps: int):
-    """Плавная безопасная прокрутка (без падения на пустом body)."""
-    for _ in range(max(1, steps)):
-        try:
-            page.evaluate(
-                """
-                () => {
-                  const root = document.scrollingElement || document.body || document.documentElement;
-                  if (!root) return 0;
-                  window.scrollBy(0, root.scrollHeight);
-                  return root.scrollHeight || 0;
-                }
-                """
-            )
-        except Exception:
-            time.sleep(0.6)
-        time.sleep(0.6)
-        try_close_popups(page)
-
-def capture_products_on_page(page) -> list:
-    """ Собираем товары из XHR + data-nm-id на плитках. """
-    captured_json = []
-
-    def on_response(res):
-        try:
-            ct = res.headers.get("content-type", "")
-            if "application/json" in ct:
-                url = res.url
-                if ("/catalog" in url) or ("/search" in url):
-                    data = res.json()
-                    captured_json.extend(parse_products_from_json_payload(data))
-        except Exception:
-            pass
-
-    page.on("response", on_response)
-    time.sleep(0.8)
-    try_close_popups(page)
-
-    safe_scroll(page, SCROLL_STEPS)
-
-    tiles = []
+    browser = pw.chromium.launch(headless=HEADLESS)
+    ctx = browser.new_context(**args)
     try:
-        tiles = page.locator("[data-nm-id]").all()
-    except Exception:
-        tiles = []
-
-    nm_from_tiles = []
-    for t in tiles[:600]:
-        try:
-            nm = int(t.get_attribute("data-nm-id") or "0")
-            if nm:
-                nm_from_tiles.append(nm)
-        except Exception:
-            pass
-
-    by_nm = {}
-    for p in captured_json:
-        by_nm[p["nm"]] = {"nm": p["nm"], "price": p.get("price", 0), "name": p.get("name","")}
-    for nm in nm_from_tiles:
-        if nm not in by_nm:
-            by_nm[nm] = {"nm": nm, "price": 0, "name": ""}
-
-    if DEBUG:
-        print(f"[debug] captured={len(captured_json)} tiles_nm={len(nm_from_tiles)} merged={len(by_nm)}")
-
-    return list(by_nm.values())
-
-def extract_price_from_text(text: str) -> int:
-    """
-    Достаём цену только из выражений с ₽ или 'руб'.
-    Берём первую правдоподобную (>0 и < 10 млн).
-    """
-    if not text:
-        return 0
-    for m in re.finditer(r"(\d[\d\s]{0,8})\s*(?:₽|руб\.?|р\.)", text, flags=re.IGNORECASE):
-        num = re.sub(r"\s+", "", m.group(1))
-        try:
-            val = int(num)
-            if 0 < val < 10_000_000:
-                return val
-        except Exception:
-            pass
-    return 0
-
-def extract_bonus_from_text(text: str) -> int:
-    m = re.search(r"(\d{2,6})\s*[₽Р]\s*за\s*отзыв", text or "", re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    m = re.search(r"балл[а-я]*\s+за\s+отзыв[^0-9]*(\d{2,6})", text or "", re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    return 0
-
-def probe_detail(context, nm: int) -> dict:
-    url = product_link(nm)
-    page = context.new_page()
-    page.set_default_timeout(15000)  # WB может грузиться долго
-    price = 0
-    bonus = 0
-    name  = ""
-    try:
-        page.goto(url, wait_until="domcontentloaded")
-        try:
-            page.wait_for_load_state("load", timeout=12000)
-        except Exception:
-            pass
-        try_close_popups(page)
-        time.sleep(0.6)
-
-        # 1) Название
-        try:
-            name = page.locator("h1").first.inner_text(timeout=2500).strip()
-        except Exception:
-            name = ""
-
-        # 2) Цена — несколько селекторов + фолбэк body (ищем только ₽/руб)
-        texts = []
-        for sel in (
-            '[data-link="text{:product_card_price}"]',
-            ".price-block__final-price",
-            ".price-block__price",
-            '[data-qa="product-price"]',
-        ):
-            try:
-                txt = page.locator(sel).first.inner_text(timeout=1800)
-                if txt:
-                    texts.append(txt)
-            except Exception:
-                pass
-        try:
-            texts.append(page.locator("body").inner_text(timeout=3000))
-        except Exception:
-            pass
-
-        for t in texts:
-            if not price:
-                p = extract_price_from_text(t)
-                if p:
-                    price = p
-
-        # 3) Бонус — из всего текста страницы (ищем «₽ за отзыв»)
-        try:
-            bigtxt = page.locator("body").inner_text(timeout=2500)
-            bonus = extract_bonus_from_text(bigtxt)
-        except Exception:
-            pass
-
-        # 4) Фолбэк: aria-label кнопки с ценой
-        if not price:
-            try:
-                aria = page.locator('button[aria-label*="₽"]').first.get_attribute("aria-label")
-                price = extract_price_from_text(aria)
-            except Exception:
-                pass
-
-        if DEBUG:
-            print(f"[detail] nm={nm} price={price} bonus={bonus} name={name[:40]}")
-    except Exception as e:
-        if DEBUG: print("[detail] error:", nm, e)
+        yield ctx
     finally:
+        ctx.close()
+        browser.close()
+
+def wait_random():
+    time.sleep(random.uniform(WB_PAGE_DELAY_MIN, WB_PAGE_DELAY_MAX))
+
+# -------------------- page parsers --------------------
+TILE_JS = """
+() => {
+  const res = [];
+  // карточки имеют data-nm-id либо data-popup-nm-id
+  const cards = document.querySelectorAll('[data-nm-id], [data-popup-nm-id]');
+  for (const c of cards) {
+    const nm = c.getAttribute('data-nm-id') || c.getAttribute('data-popup-nm-id');
+    if (!nm) continue;
+
+    // ищем любой элемент с текстом «₽ за отзыв»
+    let bonusRub = null;
+    const walker = document.createTreeWalker(c, NodeFilter.SHOW_TEXT);
+    let node;
+    while (node = walker.nextNode()) {
+      const t = (node.textContent || "").replace(/\\s+/g,' ').trim();
+      if (!t) continue;
+      // Матчим «500 ₽ за отзыв», «500₽ за отзыв»
+      const m = t.match(/(\\d[\\d\\s]{1,6})\\s*₽\\s*за\\s*отзыв/i);
+      if (m) {
+        bonusRub = parseInt(m[1].replace(/\\s/g,''), 10);
+        break;
+      }
+    }
+    res.push({nm, bonusRub});
+  }
+  return res;
+}
+"""
+
+def scan_catalog_page(page, url: str):
+    """Открывает страницу каталога, собирает nm-ID + бонус на карточках (если есть)."""
+    ok = False
+    for attempt in range(1, WB_MAX_RETRIES+1):
         try:
-            page.close()
+            page.goto(url, wait_until="domcontentloaded", timeout=12000)
+            ok = True
+            break
+        except Exception as e:
+            print(f"[warn] open error (attempt {attempt}/{WB_MAX_RETRIES}): {e}")
+    if not ok:
+        print(f"[warn] skip url after retries: {url}")
+        return [], {}
+
+    # плавная прогрузка витрины
+    for _ in range(SCROLL_STEPS):
+        try:
+            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
         except Exception:
             pass
-    return {"nm": nm, "price": price, "bonus": bonus, "name": name}
+        wait_random()
 
-def proxy_selftest(proxy_url: str) -> bool:
-    """Проверяем, что через указанный прокси вообще есть интернет."""
-    if not proxy_url:
-        return True
-    try:
-        proxies = {"http": proxy_url, "https": proxy_url}
-        r0 = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=10)
-        ok = r0.ok
-        ip = ""
+    # собираем плитки
+    tiles = page.evaluate(TILE_JS)
+    # tiles: [{nm:"123", bonusRub: 250}, ...]
+    nm_list = []
+    tile_bonus = {}
+    for t in tiles:
+        nm = str(t.get("nm") or "").strip()
+        if not nm: continue
+        nm_list.append(nm)
+        br = t.get("bonusRub")
+        if isinstance(br, int):
+            tile_bonus[nm] = br
+
+    print(f"[debug] tiles_nm={len(nm_list)} with_badge={sum(1 for v in tile_bonus.values() if v is not None)}")
+    return nm_list, tile_bonus
+
+DETAIL_JS = """
+() => {
+  // цена
+  function parseIntSafe(s){
+    s = (s||'').replace(/[^0-9]/g,'');
+    return s ? parseInt(s,10) : null;
+  }
+  let price = null;
+  // WB кладёт цену в нескольких местах, возьмём первое пригодное
+  const priceCandidates = [
+    '[data-link="text{:product^price}"]',
+    'ins[itemprop="price"]',
+    '.price-block__final-price',
+    '.price__lower-price',
+    '.price-block__price'
+  ];
+  for (const sel of priceCandidates) {
+    const el = document.querySelector(sel);
+    if (el && el.textContent) {
+      const p = parseIntSafe(el.textContent);
+      if (p) { price = p; break; }
+    }
+  }
+
+  // бонус «₽ за отзыв» — ищем по тексту
+  let bonus = null;
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let n;
+  while (n = walker.nextNode()) {
+    const t = (n.textContent||'').replace(/\\s+/g,' ').trim();
+    if (!t) continue;
+    const m = t.match(/(\\d[\\d\\s]{1,6})\\s*₽\\s*за\\s*отзыв/i);
+    if (m) { bonus = parseInt(m[1].replace(/\\s/g,''),10); break; }
+  }
+  // заголовок
+  let name = document.querySelector('h1')?.textContent?.trim() || '';
+  return {price, bonus, name};
+}
+"""
+
+def fetch_detail(page, nm: str):
+    url = f"https://www.wildberries.ru/catalog/{nm}/detail.aspx"
+    for attempt in range(1, WB_MAX_RETRIES+1):
         try:
-            ip = r0.json().get("ip")
-        except Exception:
-            pass
-        print(f"[proxy] self-test status={r0.status_code} ip={ip}")
-        return ok
-    except Exception as e:
-        print("[proxy] self-test failed:", e)
-        return False
+            page.goto(url, wait_until="domcontentloaded", timeout=9000)
+            wait_random()
+            data = page.evaluate(DETAIL_JS)
+            price = int(data.get("price") or 0)
+            bonus = int(data.get("bonus") or 0)
+            name  = (data.get("name") or "").strip()
+            dprint("[detail]", "nm=", nm, "price=", price, "bonus=", bonus, "name=", name[:30])
+            return price, bonus, name, url
+        except PWTimeout:
+            print(f"[detail] timeout nm={nm} (attempt {attempt}/{WB_MAX_RETRIES})")
+        except Exception as e:
+            print(f"[detail] error: {nm}", e)
+    return 0, 0, "", url
 
-def build_pw_proxy(proxy_url: str):
-    if not proxy_url:
-        return None
-    try:
-        u = urlparse(proxy_url)
-        scheme = (u.scheme or "http").lower()
-        # normalize socks5h -> socks5
-        if scheme in ("socks5h", "socks5", "socks"):
-            scheme = "socks5"
-        elif scheme not in ("http", "https"):
-            scheme = "http"
-        server = f"{scheme}://{u.hostname}:{u.port}"
-        out = {"server": server}
-        if u.username:
-            out["username"] = u.username
-        if u.password:
-            out["password"] = u.password
-        return out
-    except Exception:
-        return None
-
-def make_context(p, proxy_url: str, headless: bool):
-    # реалистичный UA + заголовки + часовой пояс
-    UA = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
-    )
-    browser = p.chromium.launch(
-        headless=headless,
-        args=[
-            "--no-sandbox",
-            "--disable-gpu",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-        ],
-    )
-    ctx_kwargs = dict(
-        user_agent=UA,
-        locale="ru-RU",
-        timezone_id="Europe/Moscow",
-        viewport={"width": 1280, "height": 900},
-        extra_http_headers={"Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"},
-    )
-    pw_proxy = build_pw_proxy(proxy_url)
-    if pw_proxy:
-        ctx_kwargs["proxy"] = pw_proxy
-        print("[proxy] using", pw_proxy.get("server"))
-
-    context = browser.new_context(**ctx_kwargs)
-
-    # минимальный «stealth»
-    context.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        window.chrome = { runtime: {} };
-        Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU','ru','en-US','en']});
-        Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
-    """)
-
-    # режем тяжёлые ресурсы (ускоряет и уменьшает шум)
-    def _route(route):
-        r1 = route.request
-        if r1.resource_type in ("image", "media", "font"):
-            return route.abort()
-        return route.continue_()
-    context.route("**/*", _route)
-
-    return browser, context
-
-def scan_once() -> int:
+# -------------------- main scan --------------------
+def scan_once():
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and WB_CATEGORY_URLS):
-        print("Нужно задать TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID и WB_CATEGORY_URLS")
+        print("Нужно задать TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, WB_CATEGORY_URLS")
         return 0
 
-    if DEBUG:
-        pct_info = int(BONUS_MIN_PCT * 100)
-        rub_info = f", или ≥ {BONUS_MIN_RUB}₽" if BONUS_MIN_RUB > 0 else ""
-        print(f"[start] Playwright monitor — categories mode (лимит {MAX_SEND_PER_CYCLE} шт/цикл, пауза {CHECK_INTERVAL//60} минут, бонус ≥ {pct_info}% цены{rub_info})")
+    urls = [normalize_url(u.strip()) for u in WB_CATEGORY_URLS.split("|") if u.strip()]
+    total_sent = 0
 
-    sent = 0
-    with sync_playwright() as p:
-        use_proxy = PROXY_URL
-        if PROXY_URL and not proxy_selftest(PROXY_URL):
-            print("[proxy] disabled for this cycle (self-test failed)")
-            use_proxy = ""  # работаем без прокси в этом цикле, чтобы не висеть
+    with sync_playwright() as pw, browser_ctx(pw) as ctx:
+        page = ctx.new_page()
 
-        browser, context = make_context(p, use_proxy, HEADLESS)
+        for base_url in urls:
+            # прогон по нескольким страницам
+            for page_idx in range(1, MAX_PAGES+1):
+                if total_sent >= MAX_SEND_PER_CYCLE:
+                    return total_sent
 
-        for url in WB_CATEGORY_URLS:
-            if sent >= MAX_SEND_PER_CYCLE:
-                break
+                # заменим параметр page=
+                pr = urlparse(base_url)
+                q = parse_qs(pr.query)
+                q["page"] = [str(page_idx)]
+                new_q = urlencode({k:v[0] for k,v in q.items()})
+                url = urlunparse(pr._replace(query=new_q))
 
-            page = open_page_with_retries(context, url, max_retries=3)
-            if not page:
-                if DEBUG: print("[warn] skip url after retries:", url)
-                continue
-
-            products_basic = capture_products_on_page(page)
-            to_probe = products_basic[:DETAIL_CHECK_LIMIT_PER_PAGE]
-
-            for pr in to_probe:
-                if sent >= MAX_SEND_PER_CYCLE:
-                    break
-                nm = pr["nm"]
-                if already_sent(nm):
+                print("[open]", url)
+                nm_list, tile_bonus = scan_catalog_page(page, url)
+                if not nm_list:
                     continue
 
-                price = pr.get("price", 0)
-                detail = probe_detail(context, nm)
-                if not price:
-                    price = detail.get("price", 0)
-                bonus = detail.get("bonus", 0)
-                name  = detail.get("name") or pr.get("name") or ""
+                # Предфильтр по «бонус на плитке»
+                prefiltered = nm_list
+                if BONUS_MIN_RUB > 0:
+                    prefiltered = [nm for nm in nm_list if tile_bonus.get(nm, 0) >= BONUS_MIN_RUB]
+                    dprint(f"[prefilter] by tile >= {BONUS_MIN_RUB}₽ => {len(prefiltered)}")
 
-                if bonus and price and pass_bonus_rule(bonus, price):
-                    msg = (
-                        f"🍒 <b>Баллы за отзыв</b>\n"
-                        f"{name.strip()}\n"
-                        f"<b>Цена:</b> {price} ₽\n"
-                        f"<b>Бонус:</b> {bonus} ₽\n"
-                        f"{product_link(nm)}"
-                    )
-                    tg_send(msg)
-                    mark_sent(nm)
-                    sent += 1
-                    time.sleep(0.7)
+                # ограничим деталку
+                to_check = prefiltered[:DETAIL_CHECK_LIMIT_PER_PAGE] if prefiltered else nm_list[:DETAIL_CHECK_LIMIT_PER_PAGE]
 
-            try:
-                page.close()
-            except Exception:
-                pass
+                # открываем детали и отправляем подходящее
+                for nm in to_check:
+                    if total_sent >= MAX_SEND_PER_CYCLE:
+                        break
 
-        try:
-            context.close(); browser.close()
-        except Exception:
-            pass
+                    price, bonus, name, detail_url = fetch_detail(page, nm)
+                    if price <= 0:
+                        continue
 
-    return sent
+                    ok = need_send(price, bonus)
+                    print(f"[rule] price={price} bonus={bonus} need={max(int(math.ceil(price*BONUS_MIN_PCT)), BONUS_MIN_RUB)} "
+                          f"(pct={int(BONUS_MIN_PCT*100)}, min_rub={BONUS_MIN_RUB}) -> {ok}")
 
+                    if ok:
+                        # дедуп по nm+bonus (на случай, если бонус не менялся)
+                        key = f"sent:{nm}:{bonus}"
+                        if rdb.get(key):
+                            continue
+                        msg = fmt_item(name, price, bonus, detail_url)
+                        tg_send(msg, preview=True)
+                        rdb.setex(key, 24*3600, "1")
+                        total_sent += 1
 
+                if total_sent >= MAX_SEND_PER_CYCLE:
+                    break
+
+    return total_sent
+
+# -------------------- entry --------------------
 if __name__ == "__main__":
-    pct_info = int(BONUS_MIN_PCT * 100)
-    rub_info = f", или ≥ {BONUS_MIN_RUB}₽" if BONUS_MIN_RUB > 0 else ""
-    tg_send(f"✅ Монитор запущен (лимит {MAX_SEND_PER_CYCLE}/цикл, пауза {CHECK_INTERVAL//60} мин, бонус ≥ {pct_info}%{rub_info})")
+    print("[init] Redis OK")
+    banner = fmt_banner()
+    tg_send(banner, preview=False)
+    print("[start]", banner.replace("✅ ", ""))
 
-    while True:
-        try:
-            n = scan_once()
-            print(f"[cycle] Done. Sent: {n}")
-        except KeyboardInterrupt:
-            print("[stop] Exit by user"); break
-        except Exception as e:
-            print("[error] cycle:", e)
-        time.sleep(max(5, CHECK_INTERVAL))
+    # один цикл (Railway cron/worker перезапускает согласно CHECK_INTERVAL)
+    sent = scan_once()
+    print(f"[cycle] Done. Sent: {sent}")
