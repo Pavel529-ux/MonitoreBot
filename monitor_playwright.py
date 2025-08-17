@@ -22,7 +22,7 @@ HEADLESS = False if HEADLESS in ("0", "false", "False", "no") else True
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))         # сек между циклами
 MAX_SEND_PER_CYCLE = int(os.getenv("MAX_SEND_PER_CYCLE", "5"))   # максимум отправок за цикл
 
-SCROLL_STEPS = int(os.getenv("SCROLL_STEPS", "6"))               # сколько «пролистать» страницу
+SCROLL_STEPS = int(os.getenv("SCROLL_STEPS", "6"))
 DETAIL_CHECK_LIMIT_PER_PAGE = int(os.getenv("DETAIL_CHECK_LIMIT_PER_PAGE", "60"))
 
 BONUS_MIN_PCT = float(os.getenv("BONUS_MIN_PCT", "0.5"))         # 0.5 = 50%
@@ -44,8 +44,8 @@ if REDIS_URL and redis_lib:
         print("[warn] Redis disabled:", e)
         r = None
 
-_mem = set()                 # запасной антидубль на время процесса
-SEEN_TTL = 60*60*24*14       # 14 дней
+_mem = set()
+SEEN_TTL = 60*60*24*14
 
 def seen_before(nm: int) -> bool:
     key = f"wb:sent:{nm}"
@@ -57,7 +57,7 @@ def seen_before(nm: int) -> bool:
             return False
     except Exception:
         pass
-    if nm in _mem:  # in-memory
+    if nm in _mem:
         return True
     _mem.add(nm)
     return False
@@ -75,12 +75,7 @@ def tg_send(text: str):
         print("Нужно задать TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID")
         return
     api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False}
     try:
         r = requests.post(api, json=payload, timeout=25)
         if r.status_code != 200 and DEBUG:
@@ -96,7 +91,6 @@ def pass_bonus_rule(bonus: int, price: int) -> bool:
     return bonus >= need
 
 def parse_products_from_json_payload(payload) -> list:
-    """ Извлекаем продукты из разных форм WB JSON. """
     out = []
     try:
         candidates = []
@@ -141,16 +135,18 @@ def try_close_popups(page):
 
 def open_page_with_retries(context, url: str, max_retries: int = 3):
     """Открыть страницу с ретраями; вернуть page или None."""
-    backoff = 2.0
+    backoff = 3.0
     for i in range(1, max_retries + 1):
         page = context.new_page()
-        page.set_default_timeout(15000)
-        page.set_default_navigation_timeout(15000)
+        # подлиннее таймауты — WB с прокси может открываться долго
+        page.set_default_timeout(35000)
+        page.set_default_navigation_timeout(35000)
         try:
             print("[open]", url)
+            # ждём хотя бы domcontentloaded; networkidle не обязательно наступает
             page.goto(url, wait_until="domcontentloaded")
             try:
-                page.wait_for_load_state("networkidle", timeout=12000)
+                page.wait_for_load_state("load", timeout=18000)
             except Exception:
                 pass
             try_close_popups(page)
@@ -246,7 +242,7 @@ def extract_bonus_from_text(text: str) -> int:
 def probe_detail(context, nm: int) -> dict:
     url = product_link(nm)
     page = context.new_page()
-    page.set_default_timeout(8000)
+    page.set_default_timeout(9000)
     price = 0
     bonus = 0
     name  = ""
@@ -255,22 +251,19 @@ def probe_detail(context, nm: int) -> dict:
         try_close_popups(page)
         time.sleep(0.6)
         try:
-            name = page.locator("h1").first.inner_text(timeout=2000).strip()
+            name = page.locator("h1").first.inner_text(timeout=2500).strip()
         except Exception:
             name = ""
 
         texts = []
-        for sel in (
-            '[data-link="text{:product_card_price}"]',
-            ".price-block__final-price",
-        ):
+        for sel in ('[data-link="text{:product_card_price}"]', ".price-block__final-price"):
             try:
                 txt = page.locator(sel).first.inner_text(timeout=1500)
                 texts.append(txt)
             except Exception:
                 pass
         try:
-            texts.append(page.locator("body").inner_text(timeout=2000))
+            texts.append(page.locator("body").inner_text(timeout=2500))
         except Exception:
             pass
         for t in texts:
@@ -279,7 +272,7 @@ def probe_detail(context, nm: int) -> dict:
 
         bigtxt = ""
         try:
-            bigtxt = page.locator("body").inner_text(timeout=2000)
+            bigtxt = page.locator("body").inner_text(timeout=2500)
         except Exception:
             pass
         bonus = extract_bonus_from_text(bigtxt)
@@ -310,6 +303,54 @@ def build_pw_proxy(proxy_url: str):
     except Exception:
         return None
 
+def make_context(p, proxy_url: str, headless: bool):
+    # реалистичный UA + заголовки + часовой пояс
+    UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+    )
+    browser = p.chromium.launch(
+        headless=headless,
+        args=[
+            "--no-sandbox",
+            "--disable-gpu",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ],
+    )
+    ctx_kwargs = dict(
+        user_agent=UA,
+        locale="ru-RU",
+        timezone_id="Europe/Moscow",
+        viewport={"width": 1280, "height": 900},
+        extra_http_headers={"Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"},
+    )
+    pw_proxy = build_pw_proxy(proxy_url)
+    if pw_proxy:
+        ctx_kwargs["proxy"] = pw_proxy
+        print("[proxy] using", pw_proxy.get("server"))
+
+    context = browser.new_context(**ctx_kwargs)
+
+    # минимальный «stealth»
+    context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        window.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU','ru','en-US','en']});
+        Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+    """)
+
+    # режем тяжёлые ресурсы (ускоряет и уменьшает шум)
+    def _route(route):
+        r = route.request
+        if r.resource_type in ("image", "media", "font"):
+            return route.abort()
+        return route.continue_()
+    context.route("**/*", _route)
+
+    return browser, context
+
 def scan_once() -> int:
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and WB_CATEGORY_URLS):
         print("Нужно задать TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID и WB_CATEGORY_URLS")
@@ -322,12 +363,7 @@ def scan_once() -> int:
 
     sent = 0
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS, args=["--disable-dev-shm-usage"])
-        context_kwargs = {}
-        pw_proxy = build_pw_proxy(PROXY_URL)
-        if pw_proxy:
-            context_kwargs["proxy"] = pw_proxy
-        context = browser.new_context(**context_kwargs)
+        browser, context = make_context(p, PROXY_URL, HEADLESS)
 
         for url in WB_CATEGORY_URLS:
             if sent >= MAX_SEND_PER_CYCLE:
