@@ -21,6 +21,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums.parse_mode import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
 from aiogram import html
@@ -806,7 +807,7 @@ def main():
 
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    bot = Bot(TELEGRAM_BOT_TOKEN, parse_mode=ParseMode.HTML)
+    bot = Bot(TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
     print("WB Deals Bot started")
     import asyncio
