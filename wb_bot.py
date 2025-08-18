@@ -3,7 +3,7 @@
 # playwright==1.46.0
 # redis==5.0.7
 # requests==2.32.3
-# (on deploy, run chromium install once in Start Command)
+# (after deploy, remember to run: python -m playwright install chromium)
 
 import os
 import re
@@ -25,6 +25,7 @@ from aiogram.enums.parse_mode import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
 
 from playwright.sync_api import sync_playwright
 
@@ -51,8 +52,10 @@ WB_BACKOFF_BASE    = float(envf("WB_BACKOFF_BASE", "1.2"))
 SCROLL_STEPS       = int(envf("SCROLL_STEPS", "8"))
 WB_WAIT_SELECTOR   = envf("WB_WAIT_SELECTOR", "div.product-card")
 
-# Admin fallback (pipe-separated)
+# Optional admin-provided fallbacks (pipe-separated full WB listing links)
 WB_CATEGORY_URLS   = envf("WB_CATEGORY_URLS", "")
+
+# Result size when user asks to show products now
 USER_RESULTS_LIMIT = int(envf("USER_RESULTS_LIMIT", "15"))
 
 # =============================================================
@@ -73,11 +76,10 @@ class Session:
     price_min: Optional[int] = None
     price_max: Optional[int] = None
     filter_kind: Optional[str] = None   # "pct" | "rub"
-    filter_value: Optional[int] = None  # number
+    filter_value: Optional[int] = None  # numeric value
 
     def summary(self) -> str:
-        parts = []
-        parts.append(f"Категория: {self.cat_title or 'вся витрина'}")
+        parts = [f"Категория: {self.cat_title or 'вся витрина'}"]
         if self.price_min or self.price_max:
             parts.append(f"Цена: {self.price_min or 0}–{self.price_max or '∞'} ₽")
         if self.filter_kind == 'pct' and self.filter_value:
@@ -88,10 +90,11 @@ class Session:
             parts.append("Фильтр: не задан (покажем всё с плашкой)")
         return "\n".join(parts)
 
+# In-memory session store (можно заменить на Redis при желании)
 SESS: Dict[int, Session] = {}
 
 # =============================================================
-# Redis helpers
+# Redis helpers (optional caching + anti-dup for search)
 # =============================================================
 
 RDS: Optional[redis.Redis] = None
@@ -103,14 +106,20 @@ if REDIS_URL:
         RDS = None
 
 def cache_get(key: str) -> Optional[str]:
-    if not RDS: return None
-    try: return RDS.get(key)
-    except Exception: return None
+    if not RDS:
+        return None
+    try:
+        return RDS.get(key)
+    except Exception:
+        return None
 
 def cache_setex(key: str, ttl: int, val: str) -> None:
-    if not RDS: return
-    try: RDS.setex(key, ttl, val)
-    except Exception: pass
+    if not RDS:
+        return
+    try:
+        RDS.setex(key, ttl, val)
+    except Exception:
+        pass
 
 # =============================================================
 # Playwright helpers
@@ -140,15 +149,21 @@ def new_browser(pw):
     kw = {
         "headless": (HEADLESS != "0"),
         "args": [
-            "--disable-dev-shm-usage","--no-sandbox","--disable-extensions",
-            "--disable-background-networking","--disable-background-timer-throttling",
-            "--disable-default-apps","--disable-hang-monitor","--disable-popup-blocking",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-default-apps",
+            "--disable-hang-monitor",
+            "--disable-popup-blocking",
             "--disk-cache-dir=/tmp/pw-cache",
         ],
     }
     if PROXY_URL:
         p = parse_proxy(PROXY_URL)
-        if p: kw["proxy"] = p
+        if p:
+            kw["proxy"] = p
     return pw.chromium.launch(**kw)
 
 def new_context(pw):
@@ -160,10 +175,14 @@ def new_context(pw):
         locale="ru-RU",
     )
     ctx.add_init_script("""Object.defineProperty(navigator,'webdriver',{get:()=>undefined});""")
+    # block heavy resources
     blocked = (
         "**/*.{png,jpg,jpeg,gif,webp,svg,mp4,webm,avi,mp3,woff,woff2,ttf,otf}",
-        "*://mc.yandex.*/*","*://www.googletagmanager.com/*","*://www.google-analytics.com/*",
-        "*://vk.com/*","*://staticxx.facebook.com/*",
+        "*://mc.yandex.*/*",
+        "*://www.googletagmanager.com/*",
+        "*://www.google-analytics.com/*",
+        "*://vk.com/*",
+        "*://staticxx.facebook.com/*",
     )
     for pat in blocked:
         ctx.route(pat, lambda r: r.abort())
@@ -184,23 +203,30 @@ def page_open_with_wait(page, url: str) -> bool:
     print("[open] give up:", url)
     return False
 
-def wait_random(a=0.2, b=0.5): time.sleep(random.uniform(a, b))
+def wait_random(a=0.2, b=0.5):
+    time.sleep(random.uniform(a, b))
 
 def norm_int(txt: Optional[str]) -> Optional[int]:
-    if txt is None: return None
+    if txt is None:
+        return None
     m = re.findall(r"\d+", str(txt))
-    if not m: return None
+    if not m:
+        return None
     return int("".join(m))
 
 def scan_catalog_page(page, url: str) -> Tuple[List[str], Dict[str, int], Dict[str, int]]:
+    """Return (nm_list, badge_bonus_rub, approx_price_from_tile)"""
     ok = page_open_with_wait(page, url)
-    if not ok: return [], {}, {}
+    if not ok:
+        return [], {}, {}
 
     for _ in range(SCROLL_STEPS):
-        with suppress(Exception): page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        with suppress(Exception):
+            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
         wait_random(0.1, 0.25)
 
-    tiles = page.evaluate("""
+    tiles = page.evaluate(
+        """
         () => {
           const out=[];
           document.querySelectorAll('[data-nm-id]').forEach(el=>{
@@ -218,85 +244,97 @@ def scan_catalog_page(page, url: str) -> Tuple[List[str], Dict[str, int], Dict[s
           });
           return out;
         }
-    """)
-    nm_list, badge, price_tile = [], {}, {}
+        """
+    )
+    nm_list: List[str] = []
+    badge: Dict[str, int] = {}
+    price_tile: Dict[str, int] = {}
     for t in tiles:
         nm = str(t.get("nm") or "").strip()
-        if not nm: continue
+        if not nm:
+            continue
         nm_list.append(nm)
-        br = t.get("bonusRub"); pr = t.get("priceRub")
-        if isinstance(br, int): badge[nm] = br
-        if isinstance(pr, int): price_tile[nm] = pr
-    if DEBUG: print(f"[debug] tiles={len(nm_list)} with_badge={len(badge)} with_price={len(price_tile)}")
+        br = t.get("bonusRub")
+        pr = t.get("priceRub")
+        if isinstance(br, int):
+            badge[nm] = br
+        if isinstance(pr, int):
+            price_tile[nm] = pr
+
+    if DEBUG:
+        print(f"[debug] tiles={len(nm_list)} with_badge={len(badge)} with_price={len(price_tile)}")
     return nm_list, badge, price_tile
 
 def fetch_detail_bonus_and_price(page, nm: str) -> Tuple[int, int, str, str]:
+    """Return (price, bonus, url, title) from product detail page."""
     url = f"https://www.wildberries.ru/catalog/{nm}/detail.aspx"
     title = ""
-    try: page.goto(url, wait_until="domcontentloaded", timeout=WB_NAV_TIMEOUT)
-    except Exception: page.goto(url, wait_until="load", timeout=WB_NAV_TIMEOUT)
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=WB_NAV_TIMEOUT)
+    except Exception:
+        page.goto(url, wait_until="load", timeout=WB_NAV_TIMEOUT)
 
     wait_random(0.15, 0.35)
-    with suppress(Exception): title = (page.title() or "").strip()
-    with suppress(Exception): txt = page.inner_text("body")
-    if not locals().get("txt"): txt = ""
+    with suppress(Exception):
+        title = (page.title() or "").strip()
+
+    with suppress(Exception):
+        txt = page.inner_text("body")
+    if not txt:
+        txt = ""
 
     price = 0
     with suppress(Exception):
         m = re.search(r"([\d\s]{2,})\s*₽", txt)
-        if m: price = norm_int(m.group(1)) or 0
+        if m:
+            price = norm_int(m.group(1)) or 0
 
     bonus = 0
     with suppress(Exception):
         m = re.search(r"(\d{2,6})\s*(?:₽|р)\s*за\s*отзыв", txt.lower())
-        if m: bonus = int(m.group(1))
+        if m:
+            bonus = int(m.group(1))
+
     if bonus == 0:
         with suppress(Exception):
             btn = page.query_selector("text=/за отзыв/i")
             if btn:
                 around = btn.text_content()
                 m2 = re.search(r"(\d{2,6})", around or "")
-                if m2: bonus = int(m2.group(1))
+                if m2:
+                    bonus = int(m2.group(1))
+
     return price or 0, bonus or 0, url, title
 
 # =============================================================
-# Category discovery (best-effort)
+# Category discovery
 # =============================================================
 
-# WB JSONs that иногда работают
 CANDIDATE_SUBJECT_URLS = [
     "https://static-basket-01.wb.ru/vol0/data/subject-tree/0.json",
     "https://static-basket-01.wb.ru/vol0/data/subject-tree/1.json",
     "https://static-basket-01.wb.ru/vol0/data/subject-v3.json",
 ]
 
-# Жёсткий запасной список (если всё остальное не дало результата)
-DEFAULT_TOP_CATEGORIES: List[Tuple[str, str]] = [
-    ("Женщинам",  "https://www.wildberries.ru/catalog/zhenshchinam"),
-    ("Мужчинам",  "https://www.wildberries.ru/catalog/muzhchinam"),
-    ("Детям",     "https://www.wildberries.ru/catalog/detyam"),
-    ("Обувь женская", "https://www.wildberries.ru/catalog/obuv/zhenskaya"),
-    ("Обувь мужская", "https://www.wildberries.ru/catalog/obuv/muzhskaya"),
-    ("Электроника","https://www.wildberries.ru/catalog/elektronika"),
-    ("Дом",       "https://www.wildberries.ru/catalog/dom"),
-    ("Красота",   "https://www.wildberries.ru/catalog/krasota"),
-]
-
 class CatNode:
     __slots__ = ("title", "url", "children")
     def __init__(self, title: str, url: str, children: Optional[List['CatNode']] = None):
-        self.title = title; self.url = url; self.children = children or []
-    def to_dict(self): return {"title": self.title, "url": self.url, "children": [c.to_dict() for c in self.children]}
+        self.title = title
+        self.url = url
+        self.children = children or []
+    def to_dict(self):
+        return {"title": self.title, "url": self.url, "children": [c.to_dict() for c in self.children]}
 
-def _fetch_subject_tree_via_http() -> Optional[List['CatNode']]:
-    s = requests.Session(); s.headers.update({"User-Agent": "WBMonitorBot/1.0"})
+def _fetch_subject_tree_via_http() -> Optional[List[CatNode]]:
+    s = requests.Session()
+    s.headers.update({"User-Agent": "WBMonitorBot/1.0"})
     for u in CANDIDATE_SUBJECT_URLS:
         try:
             r = s.get(u, timeout=10)
-            if r.status_code == 200 and r.text and r.text.startswith("["):
+            if r.status_code == 200 and r.text and r.text.startswith("["]:
                 data = r.json()
                 def to_nodes(items):
-                    out=[]
+                    out = []
                     for it in items:
                         name = it.get("name") or it.get("title") or "Категория"
                         href = it.get("url") or it.get("urlPath") or "https://www.wildberries.ru/"
@@ -308,33 +346,40 @@ def _fetch_subject_tree_via_http() -> Optional[List['CatNode']]:
             print("[cat http] fail:", u, e)
     return None
 
-def _scrape_top_menu_with_playwright() -> List['CatNode']:
+def _scrape_top_menu_with_playwright() -> List[CatNode]:
     print("[cat] scrape via Playwright fallback")
     nodes: List[CatNode] = []
     with sync_playwright() as pw:
-        browser, ctx = new_context(pw); page = ctx.new_page()
+        browser, ctx = new_context(pw)
+        page = ctx.new_page()
         try:
             page.goto("https://www.wildberries.ru/", wait_until="load", timeout=60000)
-            with suppress(Exception): page.wait_for_timeout(1000)
-            data = page.evaluate("""
+            with suppress(Exception):
+                page.wait_for_timeout(1000)
+            data = page.evaluate(
+                """
                 () => {
                   const pickText = el => (el && el.textContent ? el.textContent.trim() : '');
                   const res = [];
-                  document.querySelectorAll('a[href^="https://www.wildberries.ru/"]').forEach(a=>{
+                  document.querySelectorAll('nav a, .menu-categories__item a, .menu__item a').forEach(a=>{
                     const title = pickText(a);
                     const href = a.getAttribute('href') || '';
-                    if (title && href && !href.includes('#') && title.length >= 3) {
+                    if (title && href && href.startsWith('http')) {
                        res.push({title, url: href});
                     }
                   });
                   return res;
                 }
-            """)
-            seen=set()
+                """
+            )
+            seen = set()
             for it in data or []:
-                t=it.get("title"); u=it.get("url")
-                if not t or not u or (t,u) in seen: continue
-                seen.add((t,u)); nodes.append(CatNode(t,u,[]))
+                t = it.get("title")
+                u = it.get("url")
+                if not t or not u or (t, u) in seen:
+                    continue
+                seen.add((t, u))
+                nodes.append(CatNode(t, u, []))
         finally:
             with suppress(Exception): page.close()
             with suppress(Exception): ctx.close()
@@ -345,20 +390,21 @@ def get_category_tree() -> List[CatNode]:
     cached = cache_get("wb:cats:v1")
     if cached:
         try:
-            raw=json.loads(cached)
-            def to_node(d): return CatNode(d["title"], d["url"], [to_node(x) for x in d.get("children", [])])
+            raw = json.loads(cached)
+            def to_node(d):
+                return CatNode(d["title"], d["url"], [to_node(x) for x in d.get("children", [])])
             return [to_node(x) for x in raw]
-        except Exception: pass
+        except Exception:
+            pass
 
     nodes = _fetch_subject_tree_via_http()
-    if not nodes: nodes = _scrape_top_menu_with_playwright()
-
-    if not nodes and WB_CATEGORY_URLS:
-        nodes = [CatNode(f"Категория {i+1}", u.strip(), []) for i,u in enumerate(WB_CATEGORY_URLS.split('|')) if u.strip()]
-
     if not nodes:
-        # окончательный жёсткий запасной вариант
-        nodes = [CatNode(t, u, []) for t,u in DEFAULT_TOP_CATEGORIES]
+        nodes = _scrape_top_menu_with_playwright()
+    if not nodes and WB_CATEGORY_URLS:
+        tmp = []
+        for i, u in enumerate([x.strip() for x in WB_CATEGORY_URLS.split('|') if x.strip()]):
+            tmp.append(CatNode(f"Категория {i+1}", u, []))
+        nodes = tmp
 
     if nodes:
         cache_setex("wb:cats:v1", 6*3600, json.dumps([n.to_dict() for n in nodes], ensure_ascii=False))
@@ -372,9 +418,11 @@ def ensure_bonus_filter(url: str) -> str:
     return url if "ffeedbackpoints=1" in url else (url + ("&" if "?" in url else "?") + "ffeedbackpoints=1")
 
 def need_bonus(price: int, filter_kind: Optional[str], filter_value: Optional[int]) -> int:
-    if filter_kind == "pct" and filter_value: return max(int(price * filter_value / 100), 0)
-    if filter_kind == "rub" and filter_value: return int(filter_value)
-    return 1
+    if filter_kind == "pct" and filter_value:
+        return max(int(price * filter_value / 100), 0)
+    if filter_kind == "rub" and filter_value:
+        return int(filter_value)
+    return 1  # если фильтр не задан — любая плашка
 
 def run_search(cat_url: Optional[str], price_min: Optional[int], price_max: Optional[int],
                filter_kind: Optional[str], filter_value: Optional[int],
@@ -386,52 +434,75 @@ def run_search(cat_url: Optional[str], price_min: Optional[int], price_max: Opti
     else:
         urls = [ensure_bonus_filter("https://www.wildberries.ru/catalog/0/search.aspx")]
 
-    results=[]
+    results = []
     with sync_playwright() as pw:
-        browser, ctx = new_context(pw); page = ctx.new_page()
+        browser, ctx = new_context(pw)
+        page = ctx.new_page()
         try:
             for base in urls:
-                for p in range(1, WB_MAX_PAGES+1):
-                    if len(results) >= limit: break
+                for p in range(1, WB_MAX_PAGES + 1):
+                    if len(results) >= limit:
+                        break
                     u = re.sub(r"[?&]page=\d+", "", base)
                     u = u + ("&" if "?" in u else "?") + f"page={p}"
                     nm_list, badges, price_tile = scan_catalog_page(page, u)
-                    if not nm_list: continue
+                    if not nm_list:
+                        continue
 
-                    # быстрый проход: плашка + цена на плитке
+                    # Быстрый проход по тем, у кого уже видны плашка и цена
                     for nm in nm_list:
-                        if len(results) >= limit: break
-                        br = badges.get(nm); pr = price_tile.get(nm)
+                        if len(results) >= limit:
+                            break
+                        br = badges.get(nm)
+                        pr = price_tile.get(nm)
                         if br and pr:
-                            if (price_min and pr < price_min) or (price_max and pr > price_max): continue
+                            if (price_min and pr < price_min) or (price_max and pr > price_max):
+                                continue
                             need = need_bonus(pr, filter_kind, filter_value)
                             if br >= need:
-                                results.append({"nm": nm, "price": pr, "bonus": br,
-                                                "url": f"https://www.wildberries.ru/catalog/{nm}/detail.aspx",
-                                                "title": ""})
-                    # детальный проход (лимит)
-                    detail_checked=0
+                                results.append({
+                                    "nm": nm,
+                                    "price": pr,
+                                    "bonus": br,
+                                    "url": f"https://www.wildberries.ru/catalog/{nm}/detail.aspx",
+                                    "title": "",
+                                })
+
+                    # Детальные проверки (лимитированы)
+                    detail_checked = 0
                     for nm in nm_list:
-                        if len(results) >= limit or detail_checked >= DETAIL_CHECK_LIMIT_PER_PAGE: break
-                        if any(r["nm"]==nm for r in results): continue
+                        if len(results) >= limit or detail_checked >= DETAIL_CHECK_LIMIT_PER_PAGE:
+                            break
+                        if any(r["nm"] == nm for r in results):
+                            continue
                         price, bonus, durl, title = fetch_detail_bonus_and_price(page, nm)
                         detail_checked += 1
-                        if not price: continue
-                        if (price_min and price < price_min) or (price_max and price > price_max): continue
+                        if not price:
+                            continue
+                        if (price_min and price < price_min) or (price_max and price > price_max):
+                            continue
                         need = need_bonus(price, filter_kind, filter_value)
                         if bonus >= need and bonus > 0:
                             results.append({"nm": nm, "price": price, "bonus": bonus, "url": durl, "title": title})
-                if len(results) >= limit: break
+                if len(results) >= limit:
+                    break
         finally:
             with suppress(Exception): page.close()
             with suppress(Exception): ctx.close()
             with suppress(Exception): browser.close()
 
-    def ratio(x): pr = x.get("price") or 1; return (x.get("bonus") or 0)/max(pr,1)
-    results.sort(key=(lambda x: (ratio(x), x.get("bonus",0))) if filter_kind=="pct"
-                 else (lambda x: (x.get("bonus",0), ratio(x))), reverse=True)
-    uniq={}
-    for r in results: uniq.setdefault(r["nm"], r)
+    def ratio(x):
+        pr = x.get("price") or 1
+        return (x.get("bonus") or 0) / max(pr, 1)
+
+    if filter_kind == "pct":
+        results.sort(key=lambda x: (ratio(x), x.get("bonus", 0)), reverse=True)
+    else:
+        results.sort(key=lambda x: (x.get("bonus", 0), ratio(x)), reverse=True)
+
+    uniq = {}
+    for r in results:
+        uniq.setdefault(r["nm"], r)
     return list(uniq.values())[:limit]
 
 # =============================================================
@@ -453,19 +524,24 @@ async def on_start(m: Message, bot: Bot):
     )
 
 def paginate(items: List[Tuple[str, str]], page: int, per_page: int = 10):
-    total=len(items); start=page*per_page; end=min(total, start+per_page)
+    total = len(items)
+    start = page * per_page
+    end = min(total, start + per_page)
     return items[start:end], total
 
 def build_cat_kb(nodes: List['CatNode'], page: int = 0) -> InlineKeyboardBuilder:
-    pairs=[(n.title[:64], n.url) for n in nodes]
-    kb=InlineKeyboardBuilder()
+    pairs = [(n.title[:64], n.url) for n in nodes]
+    kb = InlineKeyboardBuilder()
     page_items, total = paginate(pairs, page)
     for title, url in page_items:
         kb.button(text=title, callback_data=f"cat:{page}:{url}")
-    nav=[]
-    if page>0: nav.append(("◀️ Назад", f"catpage:{page-1}"))
-    if (page+1)*10 < total: nav.append(("Вперёд ▶️", f"catpage:{page+1}"))
-    for t,d in nav: kb.button(text=t, callback_data=d)
+    nav = []
+    if page > 0:
+        nav.append(("◀️ Назад", f"catpage:{page-1}"))
+    if (page + 1) * 10 < total:
+        nav.append(("Вперёд ▶️", f"catpage:{page+1}"))
+    for t, d in nav:
+        kb.button(text=t, callback_data=d)
     kb.button(text="Пропустить к фильтрам", callback_data="skip_to_filters")
     kb.adjust(1)
     return kb
@@ -474,7 +550,9 @@ def build_cat_kb(nodes: List['CatNode'], page: int = 0) -> InlineKeyboardBuilder
 async def on_choose_cat(cb: CallbackQuery):
     nodes = await asyncio.to_thread(get_category_tree)
     if not nodes:
-        await cb.message.edit_text("Не удалось загрузить категории сейчас. Попробуйте ещё раз или используйте пропуск к фильтрам.")
+        await cb.message.edit_text(
+            "Не удалось загрузить категории сейчас. Попробуйте ещё раз или используйте пропуск к фильтрам."
+        )
         return
     kb = build_cat_kb(nodes, page=0)
     await cb.message.edit_text("Выберите категорию:", reply_markup=kb.as_markup())
@@ -490,7 +568,8 @@ async def on_cat_page(cb: CallbackQuery):
 async def on_cat_pick(cb: CallbackQuery):
     _tag, _page_str, url = cb.data.split(":", 2)
     s = SESS.setdefault(cb.from_user.id, Session())
-    s.cat_url = url; s.cat_title = "Выбранная категория"
+    s.cat_url = url
+    s.cat_title = "Выбранная категория"
     kb = InlineKeyboardBuilder()
     kb.button(text="Задать диапазон цены", callback_data="price:set")
     kb.button(text="Пропустить цену", callback_data="price:skip")
@@ -500,7 +579,8 @@ async def on_cat_pick(cb: CallbackQuery):
 @router.callback_query(F.data == "skip_to_filters")
 async def on_skip_to_filters(cb: CallbackQuery):
     s = SESS.setdefault(cb.from_user.id, Session())
-    s.cat_url = None; s.cat_title = None
+    s.cat_url = None
+    s.cat_title = None
     kb = InlineKeyboardBuilder()
     kb.button(text="Задать диапазон цены", callback_data="price:set")
     kb.button(text="Пропустить цену", callback_data="price:skip")
@@ -508,72 +588,84 @@ async def on_skip_to_filters(cb: CallbackQuery):
     await cb.message.edit_text("Хорошо, пропускаем выбор категорий. Зададим цену?", reply_markup=kb.as_markup())
 
 @router.callback_query(F.data == "price:set")
-async def on_price_set(cb: CallbackQuery, dp: Dispatcher):
+async def on_price_set(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text(
         "Отправьте диапазон цены в сообщении в формате:  MIN-MAX  (например 500-2500).\n"
         "Можно одну границу: 0-2000 или 1500-"
     )
-    await dp.fsm.set_state(cb.from_user.id, Flow.FILTER_PRICE.state)
+    await state.set_state(Flow.FILTER_PRICE)
 
 @router.message(Flow.FILTER_PRICE)
-async def on_price_received(m: Message, dp: Dispatcher):
+async def on_price_received(m: Message, state: FSMContext):
     s = SESS.setdefault(m.from_user.id, Session())
-    txt=(m.text or "").replace(" ",""); m1=m2=None
+    txt = (m.text or "").replace(" ", "")
+    m1, m2 = None, None
     if "-" in txt:
-        a,b = txt.split("-",1)
-        if a: m1 = int(re.sub("[^0-9]","",a) or 0)
-        if b: m2 = int(re.sub("[^0-9]","",b) or 0) if re.sub("[^0-9]","",b) else None
+        a, b = txt.split("-", 1)
+        if a:
+            m1 = int(re.sub("[^0-9]", "", a) or 0)
+        if b:
+            nums = re.sub("[^0-9]", "", b)
+            m2 = int(nums) if nums else None
     else:
-        m2 = int(re.sub("[^0-9]","",txt) or 0)
+        m2 = int(re.sub("[^0-9]", "", txt) or 0)
     s.price_min, s.price_max = m1, m2
 
-    kb=InlineKeyboardBuilder()
+    kb = InlineKeyboardBuilder()
     kb.button(text="Процент от цены", callback_data="fkind:pct")
     kb.button(text="Рубли за отзыв", callback_data="fkind:rub")
     kb.button(text="Пропустить фильтр", callback_data="fkind:skip")
     kb.adjust(1)
     await m.answer("Как фильтровать по бонусу?", reply_markup=kb.as_markup())
-    await dp.fsm.set_state(m.from_user.id, Flow.FILTER_KIND.state)
+    await state.set_state(Flow.FILTER_KIND)
 
 @router.callback_query(F.data == "price:skip")
-async def on_price_skip(cb: CallbackQuery, dp: Dispatcher):
-    s = SESS.setdefault(cb.from_user.id, Session()); s.price_min = s.price_max = None
-    kb=InlineKeyboardBuilder()
+async def on_price_skip(cb: CallbackQuery, state: FSMContext):
+    s = SESS.setdefault(cb.from_user.id, Session())
+    s.price_min = s.price_max = None
+    kb = InlineKeyboardBuilder()
     kb.button(text="Процент от цены", callback_data="fkind:pct")
     kb.button(text="Рубли за отзыв", callback_data="fkind:rub")
     kb.button(text="Пропустить фильтр", callback_data="fkind:skip")
     kb.adjust(1)
     await cb.message.edit_text("Как фильтровать по бонусу?", reply_markup=kb.as_markup())
-    await dp.fsm.set_state(cb.from_user.id, Flow.FILTER_KIND.state)
+    await state.set_state(Flow.FILTER_KIND)
 
 @router.callback_query(F.data.startswith("fkind:"))
-async def on_filter_kind(cb: CallbackQuery, dp: Dispatcher):
-    kind = cb.data.split(":",1)[1]
+async def on_filter_kind(cb: CallbackQuery, state: FSMContext):
+    kind = cb.data.split(":", 1)[1]
     s = SESS.setdefault(cb.from_user.id, Session())
     if kind == "skip":
-        s.filter_kind = s.filter_value = None
-        kb=InlineKeyboardBuilder(); kb.button(text="Показать товары", callback_data="show:now"); kb.adjust(1)
-        await cb.message.edit_text("Отлично! Вот сводка параметров:\n\n"+s.summary(), reply_markup=kb.as_markup())
-        await dp.fsm.clear(); return
+        s.filter_kind, s.filter_value = None, None
+        kb = InlineKeyboardBuilder()
+        kb.button(text="Показать товары", callback_data="show:now")
+        kb.adjust(1)
+        await cb.message.edit_text("Отлично! Вот сводка параметров:\n\n" + s.summary(), reply_markup=kb.as_markup())
+        await state.clear()
+        return
     s.filter_kind = kind
     await cb.message.edit_text(
         "Введите число:\n"
-        "• если выбрали процент — укажите, например 20 (это ≥20% от цены)\n"
+        "• если выбрали процент — например 20 (это ≥20% от цены)\n"
         "• если выбрали рубли — например 500 (это ≥500 ₽ за отзыв)"
     )
-    await dp.fsm.set_state(cb.from_user.id, Flow.FILTER_VALUE.state)
+    await state.set_state(Flow.FILTER_VALUE)
 
 @router.message(Flow.FILTER_VALUE)
-async def on_filter_value(m: Message, dp: Dispatcher):
+async def on_filter_value(m: Message, state: FSMContext):
     s = SESS.setdefault(m.from_user.id, Session())
-    val = int(re.sub("[^0-9]","", m.text or "0") or 0)
-    s.filter_value = val
-    kb=InlineKeyboardBuilder(); kb.button(text="Показать товары", callback_data="show:now"); kb.adjust(1)
-    await m.answer("Параметры заданы.\n\n"+s.summary(), reply_markup=kb.as_markup())
-    await dp.fsm.clear()
+    s.filter_value = int(re.sub("[^0-9]", "", m.text or "0") or 0)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Показать товары", callback_data="show:now")
+    kb.adjust(1)
+    await m.answer("Параметры заданы.\n\n" + s.summary(), reply_markup=kb.as_markup())
+    await state.clear()
 
 def fmt_item(i: dict) -> str:
-    price=i.get("price"); bonus=i.get("bonus"); title=i.get("title") or "Товар"; url=i.get("url")
+    price = i.get("price")
+    bonus = i.get("bonus")
+    title = i.get("title") or "Товар"
+    url = i.get("url") or ""
     ratio = int(100 * (bonus or 0) / max(price or 1, 1))
     return (
         f"<b>{html.quote(title)}</b>\n"
@@ -588,22 +680,32 @@ async def on_show_now(cb: CallbackQuery):
     await cb.message.edit_text("Ищу подходящие товары… Это может занять 10–25 секунд.")
     try:
         res = await asyncio.to_thread(
-            run_search, s.cat_url, s.price_min, s.price_max, s.filter_kind, s.filter_value, USER_RESULTS_LIMIT
+            run_search,
+            s.cat_url,
+            s.price_min,
+            s.price_max,
+            s.filter_kind,
+            s.filter_value,
+            USER_RESULTS_LIMIT,
         )
     except Exception as e:
         await cb.message.answer("Не удалось выполнить поиск сейчас. Попробуйте ещё раз.")
-        print("[search error]", repr(e)); return
-
-    if not res:
-        await cb.message.answer("Подходящих товаров не нашлось. Попробуйте ослабить фильтры или выбрать другую категорию.")
+        print("[search error]", repr(e))
         return
 
-    chunk=[]; total_sent=0
-    for i,item in enumerate(res,1):
+    if not res:
+        await cb.message.answer(
+            "Подходящих товаров не нашлось. Попробуйте ослабить фильтры или выбрать другую категорию."
+        )
+        return
+
+    chunk, total_sent = [], 0
+    for i, item in enumerate(res, 1):
         chunk.append(fmt_item(item))
-        if len(chunk)==5 or i==len(res):
+        if len(chunk) == 5 or i == len(res):
             await cb.message.answer("\n\n".join(chunk), parse_mode=ParseMode.HTML, disable_web_page_preview=False)
-            total_sent += len(chunk); chunk=[]
+            total_sent += len(chunk)
+            chunk = []
     await cb.message.answer(f"Готово! Показано товаров: {total_sent}.")
 
 # =============================================================
@@ -617,7 +719,6 @@ def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     bot = Bot(TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-
     print("WB Deals Bot started")
     asyncio.run(dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()))
 
