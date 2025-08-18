@@ -195,7 +195,6 @@ def page_open_with_wait(page, url: str) -> bool:
                 page.goto(url, wait_until="domcontentloaded", timeout=WB_NAV_TIMEOUT)
             except Exception:
                 page.goto(url, wait_until="load", timeout=WB_NAV_TIMEOUT)
-WB_WAIT_SELECTOR   = envf("WB_WAIT_SELECTOR", "[data-nm-id]")
             return True
         except Exception as e:
             print(f"[open warn] attempt {attempt}/{WB_MAX_RETRIES}: {e}")
