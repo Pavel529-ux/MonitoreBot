@@ -59,7 +59,7 @@ def build_keyboard(categories):
         [InlineKeyboardButton(text=name, callback_data=f"category:{url}")]
         for name, url in categories.items()
     ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons[:30])  # максимум 30 кнопок (Telegram ограничение)
+    return InlineKeyboardMarkup(inline_keyboard=buttons[:30])  # максимум 30 кнопок
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
@@ -71,7 +71,6 @@ async def process_category(callback: CallbackQuery):
     category_url = callback.data.split(":", 1)[1]
     await callback.message.edit_text("🔍 Ищу товары...")
 
-    # 🔧 Здесь должна быть интеграция с реальным парсером Wildberries
     fake_items = [
         {
             "name": f"Товар #{i+1}",
@@ -90,8 +89,9 @@ async def process_category(callback: CallbackQuery):
     if not filtered:
         await callback.message.edit_text("❌ Подходящих товаров не найдено.")
     else:
-        text = "🎯 Найденные товары:\n\n"
+        text = "🎯 Найденные товары:
 
+"
         for item in filtered:
             text += f"🛍 <b>{item['name']}</b>
 💸 Бонус: {item['bonus']} ₽
