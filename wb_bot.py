@@ -331,7 +331,7 @@ def _fetch_subject_tree_via_http() -> Optional[List[CatNode]]:
     for u in CANDIDATE_SUBJECT_URLS:
         try:
             r = s.get(u, timeout=10)
-            if r.status_code == 200 and r.text and r.text.startswith("["]:
+            if r.status_code == 200 and r.text and r.text.startswith("["):
                 data = r.json()
                 def to_nodes(items):
                     out = []
