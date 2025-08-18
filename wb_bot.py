@@ -758,7 +758,7 @@ def fmt_item(i: dict) -> str:
         f"<b>{html.quote(title)}</b>\n"
         f"Цена: <b>{price or '?'} ₽</b>\n"
         f"Бонус: <b>{bonus or 0} ₽</b> (≈ {ratio}%)\n"
-        f"{html.link("Открыть", url)}"
+        f"{html.link('Открыть', url)}"
     )
 
 
