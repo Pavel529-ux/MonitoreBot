@@ -90,7 +90,7 @@ async def process_category(callback: CallbackQuery):
     if not filtered:
         await callback.message.edit_text("❌ Подходящих товаров не найдено.")
     else:
-        text = "🎯 Найденные товары:
+        text = "🎯 Найденные товары:"
 
 "
         for item in filtered:
