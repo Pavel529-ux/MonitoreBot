@@ -1,5 +1,4 @@
-requests==2.32.3
-redis==5.0.7
-pysocks
-playwright==1.46.0
 aiogram==3.7.0
+playwright==1.46.0
+redis==5.0.7
+requests==2.32.3
