@@ -11,13 +11,13 @@ import json
 import time
 import random
 import asyncio
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 from contextlib import suppress
 
 import requests
 import redis
-from aiogram import Bot, Dispatcher, Router, F
+from aiogram import Bot, Dispatcher, Router, F, html
 from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -25,7 +25,6 @@ from aiogram.enums.parse_mode import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
-from aiogram import html
 
 from playwright.sync_api import sync_playwright
 
@@ -350,7 +349,6 @@ def fetch_detail_bonus_and_price(page, nm: str) -> Tuple[int, int, str, str]:
 
 # We try a few likely static endpoints; fall back to scraping top menu with Playwright.
 CANDIDATE_SUBJECT_URLS = [
-    # These endpoints may change over time. We try multiple; if all fail we scrape.
     "https://static-basket-01.wb.ru/vol0/data/subject-tree/0.json",
     "https://static-basket-01.wb.ru/vol0/data/subject-tree/1.json",
     "https://static-basket-01.wb.ru/vol0/data/subject-v3.json",
@@ -376,7 +374,6 @@ def _fetch_subject_tree_via_http() -> Optional[List[CatNode]]:
             r = s.get(u, timeout=10)
             if r.status_code == 200 and r.text and r.text.startswith("["):
                 data = r.json()
-                # Expecting nodes with fields like id, name, url, children
                 def to_nodes(items):
                     out = []
                     for it in items:
@@ -401,7 +398,6 @@ def _scrape_top_menu_with_playwright() -> List[CatNode]:
             page.goto("https://www.wildberries.ru/", wait_until="load", timeout=60000)
             with suppress(Exception):
                 page.wait_for_timeout(1000)
-            # Try to pull top menu items and submenus (best-effort selectors)
             data = page.evaluate(
                 """
                 () => {
@@ -418,7 +414,6 @@ def _scrape_top_menu_with_playwright() -> List[CatNode]:
                 }
                 """
             )
-            # Build a flat list as top-level options to avoid brittle deep nesting.
             seen = set()
             for it in data or []:
                 t = it.get("title")
@@ -428,12 +423,9 @@ def _scrape_top_menu_with_playwright() -> List[CatNode]:
                 seen.add((t, u))
                 nodes.append(CatNode(t, u, []))
         finally:
-            with suppress(Exception):
-                page.close()
-            with suppress(Exception):
-                ctx.close()
-            with suppress(Exception):
-                browser.close()
+            with suppress(Exception): page.close()
+            with suppress(Exception): ctx.close()
+            with suppress(Exception): browser.close()
     return nodes
 
 
@@ -453,7 +445,6 @@ def get_category_tree() -> List[CatNode]:
     if not nodes:
         nodes = _scrape_top_menu_with_playwright()
     if not nodes and WB_CATEGORY_URLS:
-        # fallback to admin-provided list
         tmp = []
         for i, u in enumerate([x.strip() for x in WB_CATEGORY_URLS.split('|') if x.strip()]):
             tmp.append(CatNode(f"Категория {i+1}", u, []))
@@ -476,8 +467,7 @@ def need_bonus(price: int, filter_kind: Optional[str], filter_value: Optional[in
         return max(int(price * filter_value / 100), 0)
     if filter_kind == "rub" and filter_value:
         return int(filter_value)
-    # If no filter provided, any badge/bonus is OK (need 1+)
-    return 1
+    return 1  # no filter -> любой видимый бонус ок
 
 
 def run_search(cat_url: Optional[str], price_min: Optional[int], price_max: Optional[int],
@@ -507,7 +497,7 @@ def run_search(cat_url: Optional[str], price_min: Optional[int], price_max: Opti
                     if not nm_list:
                         continue
 
-                    # quick pass for items that have a badge and tile-price
+                    # quick pass: по плашке и цене с плитки
                     for nm in nm_list:
                         if len(results) >= limit:
                             break
@@ -545,14 +535,11 @@ def run_search(cat_url: Optional[str], price_min: Optional[int], price_max: Opti
                 if len(results) >= limit:
                     break
         finally:
-            with suppress(Exception):
-                page.close()
-            with suppress(Exception):
-                ctx.close()
-            with suppress(Exception):
-                browser.close()
+            with suppress(Exception): page.close()
+            with suppress(Exception): ctx.close()
+            with suppress(Exception): browser.close()
 
-    # sort: if pct filter -> by (bonus/price desc), else by bonus desc
+    # sort: если фильтр в %, то по доле; иначе по величине бонуса
     def ratio(x):
         pr = x.get("price") or 1
         return (x.get("bonus") or 0) / max(pr, 1)
@@ -562,7 +549,6 @@ def run_search(cat_url: Optional[str], price_min: Optional[int], price_max: Opti
     else:
         results.sort(key=lambda x: (x.get("bonus", 0), ratio(x)), reverse=True)
 
-    # unique by nm
     uniq = {}
     for r in results:
         uniq.setdefault(r["nm"], r)
@@ -577,7 +563,7 @@ router = Router()
 
 @router.message(CommandStart())
 async def on_start(m: Message, bot: Bot):
-    s = SESS.setdefault(m.from_user.id, Session())
+    SESS.setdefault(m.from_user.id, Session())
     kb = InlineKeyboardBuilder()
     kb.button(text="Выбрать категорию", callback_data="choose_cat")
     kb.button(text="Пропустить к фильтрам", callback_data="skip_to_filters")
@@ -602,7 +588,6 @@ def build_cat_kb(nodes: List[CatNode], page: int = 0) -> InlineKeyboardBuilder:
     page_items, total = paginate(pairs, page)
     for title, url in page_items:
         kb.button(text=title, callback_data=f"cat:{page}:{url}")
-    # nav row
     nav = []
     if page > 0:
         nav.append(("◀️ Назад", f"catpage:{page-1}"))
@@ -610,7 +595,6 @@ def build_cat_kb(nodes: List[CatNode], page: int = 0) -> InlineKeyboardBuilder:
         nav.append(("Вперёд ▶️", f"catpage:{page+1}"))
     for t, d in nav:
         kb.button(text=t, callback_data=d)
-    # actions
     kb.button(text="Пропустить к фильтрам", callback_data="skip_to_filters")
     kb.adjust(1)
     return kb
@@ -637,8 +621,7 @@ async def on_cat_page(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("cat:"))
 async def on_cat_pick(cb: CallbackQuery):
-    # We treat any clicked item as a final category URL (deep trees vary). Users can refine with filters next.
-    _tag, page_str, url = cb.data.split(":", 2)
+    _tag, _page_str, url = cb.data.split(":", 2)
     s = SESS.setdefault(cb.from_user.id, Session())
     s.cat_url = url
     s.cat_title = "Выбранная категория"
@@ -688,7 +671,6 @@ async def on_price_received(m: Message, dp: Dispatcher):
         if b:
             m2 = int(re.sub("[^0-9]", "", b) or 0) if re.sub("[^0-9]", "", b) else None
     else:
-        # single number -> treat as max
         m2 = int(re.sub("[^0-9]", "", txt) or 0)
 
     s.price_min, s.price_max = m1, m2
@@ -771,14 +753,14 @@ async def on_show_now(cb: CallbackQuery):
 
     try:
         res = await asyncio.to_thread(
-    run_search,
-    s.cat_url,
-    s.price_min,
-    s.price_max,
-    s.filter_kind,
-    s.filter_value,
-    USER_RESULTS_LIMIT,  # это аргумент limit
-)
+            run_search,
+            s.cat_url,
+            s.price_min,
+            s.price_max,
+            s.filter_kind,
+            s.filter_value,
+            USER_RESULTS_LIMIT,
+        )
     except Exception as e:
         await cb.message.answer("Не удалось выполнить поиск сейчас. Попробуйте ещё раз.")
         print("[search error]", repr(e))
@@ -788,7 +770,7 @@ async def on_show_now(cb: CallbackQuery):
         await cb.message.answer("Подходящих товаров не нашлось. Попробуйте ослабить фильтры или выбрать другую категорию.")
         return
 
-    # Send batched to avoid huge single message
+    # batched sending
     chunk = []
     total_sent = 0
     for i, item in enumerate(res, 1):
@@ -812,10 +794,9 @@ def main():
     bot = Bot(TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
     print("WB Deals Bot started")
-    import asyncio
-    # aiogram v3 launcher
     asyncio.run(dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()))
 
 
 if __name__ == "__main__":
     main()
+
