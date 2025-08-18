@@ -50,7 +50,7 @@ WB_NAV_TIMEOUT     = int(envf("WB_NAV_TIMEOUT", "45000"))  # ms
 WB_MAX_RETRIES     = int(envf("WB_MAX_RETRIES", "3"))
 WB_BACKOFF_BASE    = float(envf("WB_BACKOFF_BASE", "1.2"))
 SCROLL_STEPS       = int(envf("SCROLL_STEPS", "8"))
-WB_WAIT_SELECTOR   = envf("WB_WAIT_SELECTOR", "div.product-card")
+WB_WAIT_SELECTOR   = envf("WB_WAIT_SELECTOR", "[data-nm-id]")
 
 # Optional admin-provided fallbacks (pipe-separated full WB listing links)
 WB_CATEGORY_URLS   = envf("WB_CATEGORY_URLS", "")
@@ -195,7 +195,7 @@ def page_open_with_wait(page, url: str) -> bool:
                 page.goto(url, wait_until="domcontentloaded", timeout=WB_NAV_TIMEOUT)
             except Exception:
                 page.goto(url, wait_until="load", timeout=WB_NAV_TIMEOUT)
-            page.wait_for_selector(WB_WAIT_SELECTOR, timeout=WB_NAV_TIMEOUT // 2, state="visible")
+WB_WAIT_SELECTOR   = envf("WB_WAIT_SELECTOR", "[data-nm-id]")
             return True
         except Exception as e:
             print(f"[open warn] attempt {attempt}/{WB_MAX_RETRIES}: {e}")
@@ -331,7 +331,7 @@ def _fetch_subject_tree_via_http() -> Optional[List[CatNode]]:
     for u in CANDIDATE_SUBJECT_URLS:
         try:
             r = s.get(u, timeout=10)
-            if r.status_code == 200 and r.text and r.text.startswith("["):
+            if r.status_code == 200 and r.text and r.text.startswith("["]:
                 data = r.json()
                 def to_nodes(items):
                     out = []
