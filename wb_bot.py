@@ -10,6 +10,7 @@ import re
 import json
 import time
 import random
+import asyncio
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple
 from contextlib import suppress
@@ -617,7 +618,7 @@ def build_cat_kb(nodes: List[CatNode], page: int = 0) -> InlineKeyboardBuilder:
 
 @router.callback_query(F.data == "choose_cat")
 async def on_choose_cat(cb: CallbackQuery):
-    nodes = get_category_tree()
+    nodes = await asyncio.to_thread(get_category_tree)
     if not nodes:
         await cb.message.edit_text(
             "Не удалось загрузить категории сейчас. Попробуйте ещё раз или используйте пропуск к фильтрам.")
@@ -629,7 +630,7 @@ async def on_choose_cat(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("catpage:"))
 async def on_cat_page(cb: CallbackQuery):
     page = int(cb.data.split(":")[1])
-    nodes = get_category_tree()
+    nodes = await asyncio.to_thread(get_category_tree)
     kb = build_cat_kb(nodes, page=page)
     await cb.message.edit_text("Выберите категорию:", reply_markup=kb.as_markup())
 
@@ -769,14 +770,15 @@ async def on_show_now(cb: CallbackQuery):
     await cb.message.edit_text("Ищу подходящие товары… Это может занять 10–25 секунд.")
 
     try:
-        res = run_search(
-            s.cat_url,
-            s.price_min,
-            s.price_max,
-            s.filter_kind,
-            s.filter_value,
-            limit=USER_RESULTS_LIMIT,
-        )
+        res = await asyncio.to_thread(
+    run_search,
+    s.cat_url,
+    s.price_min,
+    s.price_max,
+    s.filter_kind,
+    s.filter_value,
+    USER_RESULTS_LIMIT,  # это аргумент limit
+)
     except Exception as e:
         await cb.message.answer("Не удалось выполнить поиск сейчас. Попробуйте ещё раз.")
         print("[search error]", repr(e))
