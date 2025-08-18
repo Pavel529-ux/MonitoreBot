@@ -59,7 +59,7 @@ def build_keyboard(categories):
         [InlineKeyboardButton(text=name, callback_data=f"category:{url}")]
         for name, url in categories.items()
     ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons[:30])  # максимум 30 кнопок
+    return InlineKeyboardMarkup(inline_keyboard=buttons[:30])
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
@@ -89,16 +89,21 @@ async def process_category(callback: CallbackQuery):
     if not filtered:
         await callback.message.edit_text("❌ Подходящих товаров не найдено.")
     else:
-        text = "🎯 Найденные товары:\n\n"
+        text = "🎯 Найденные товары:
 
 "
         for item in filtered:
-            text += f"🛍 <b>{item['name']}</b>
-💸 Бонус: {item['bonus']} ₽
-💰 Цена: {item['price']} ₽
-🔗 <a href='{item['url']}'>Смотреть</a>
+            text += (
+                f"🛍 <b>{item['name']}</b>
+"
+                f"💸 Бонус: {item['bonus']} ₽
+"
+                f"💰 Цена: {item['price']} ₽
+"
+                f"🔗 <a href='{item['url']}'>Смотреть</a>
 
 "
+            )
         await callback.message.edit_text(text, parse_mode="HTML")
 
 async def main():
