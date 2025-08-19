@@ -1,104 +1,86 @@
 import asyncio
 import logging
 import os
-import json
-import random
-import aiohttp
-
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from redis.asyncio import Redis
 
+from monitor_playwright import run_monitor  # ✅ Импорт основного парсера
+
+# 🔐 Переменные окружения
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 REDIS_URL = os.getenv("REDIS_URL")
 BONUS_MIN_PCT = int(os.getenv("BONUS_MIN_PCT", 20))
 BONUS_MIN_RUB = int(os.getenv("BONUS_MIN_RUB", 200))
 
+# 📦 Redis
 redis = Redis.from_url(REDIS_URL, decode_responses=True)
+
+# ⚙️ Логирование и бот
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-CATEGORY_CACHE_KEY = "wb_categories"
-CATEGORY_CACHE_TTL = 3600  # 1 час
+# 📁 Категории (можно расширить вручную или автоматически позже)
+CATEGORIES = {
+    "Одежда": "https://www.wildberries.ru/catalog/zhenshchinam/odezhda",
+    "Обувь": "https://www.wildberries.ru/catalog/obuv",
+    "Электроника": "https://www.wildberries.ru/catalog/elektronika",
+    "Косметика": "https://www.wildberries.ru/catalog/krasota",
+}
 
-async def fetch_categories():
-    url = "https://static.wbstatic.net/data/main-menu-ru-ru.json"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                return await response.json()
-    except Exception as e:
-        logging.error(f"Ошибка загрузки категорий: {e}")
-        return []
+# 🎛 Главное меню
+def main_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=cat, callback_data=f"category:{url}")]
+            for cat, url in CATEGORIES.items()
+        ]
+    )
 
-async def get_categories():
-    cached = await redis.get(CATEGORY_CACHE_KEY)
-    if cached:
-        return json.loads(cached)
-
-    raw = await fetch_categories()
-    categories = {}
-
-    def extract_links(items):
-        for item in items:
-            if "url" in item and item["url"].startswith("/catalog/"):
-                full_url = f"https://www.wildberries.ru{item['url']}"
-                name = item.get("name", "Категория")
-                categories[name] = full_url
-            if "childs" in item:
-                extract_links(item["childs"])
-
-    extract_links(raw)
-    await redis.set(CATEGORY_CACHE_KEY, json.dumps(categories), ex=CATEGORY_CACHE_TTL)
-    return categories
-
-def build_keyboard(categories):
-    buttons = [
-        [InlineKeyboardButton(text=name, callback_data=f"category:{url}")]
-        for name, url in categories.items()
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons[:30])
-
+# 👋 Команда /start
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    categories = await get_categories()
-    await message.answer("👋 Привет! Выбери категорию для поиска товаров:", reply_markup=build_keyboard(categories))
+    await message.answer(
+        "👋 Привет! Выбери категорию для поиска товаров с отзывными бонусами:",
+        reply_markup=main_keyboard()
+    )
 
+# 🛒 Обработка категории
 @dp.callback_query(F.data.startswith("category:"))
 async def process_category(callback: CallbackQuery):
     category_url = callback.data.split(":", 1)[1]
-    await callback.message.edit_text("🔍 Ищу товары...")
+    await callback.message.edit_text("🔍 Ищу товары, это займёт 5–15 секунд...")
 
-    fake_items = [
-        {
-            "name": f"Товар #{i+1}",
-            "bonus": random.randint(100, 500),
-            "price": random.randint(300, 1500),
-            "url": f"{category_url}/detail.aspx?fake_id={random.randint(100000,999999)}"
-        }
-        for i in range(10)
-    ]
+    try:
+        # ⚙️ Парсим реальные товары через playwright
+        items = await run_monitor(
+            urls=[category_url],
+            min_bonus_pct=BONUS_MIN_PCT,
+            min_bonus_rub=BONUS_MIN_RUB
+        )
 
-    filtered = [
-        item for item in fake_items
-        if item["bonus"] >= BONUS_MIN_RUB and item["bonus"] / item["price"] * 100 >= BONUS_MIN_PCT
-    ]
+        if not items:
+            await callback.message.edit_text("❌ Подходящих товаров не найдено.")
+            return
 
-    if not filtered:
-        await callback.message.edit_text("❌ Подходящих товаров не найдено.")
-    else:
         text = "🎯 Найденные товары:\n\n"
-        for item in filtered:
+        for item in items[:10]:  # максимум 10 штук
             text += (
                 f"🛍 <b>{item['name']}</b>\n"
-                f"💸 Бонус: {item['bonus']} ₽\n"
                 f"💰 Цена: {item['price']} ₽\n"
+                f"🎁 Бонус: {item['bonus']} ₽\n"
                 f"🔗 <a href='{item['url']}'>Смотреть</a>\n\n"
             )
+
         await callback.message.edit_text(text, parse_mode="HTML")
 
+    except Exception as e:
+        logging.exception("Ошибка при поиске товаров")
+        await callback.message.edit_text("⚠️ Произошла ошибка при поиске. Попробуй позже.")
+
+# 🚀 Запуск
 async def main():
     await dp.start_polling(bot)
 
