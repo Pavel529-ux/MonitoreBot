@@ -38,6 +38,7 @@ async def fetch_categories():
     try:
         async with async_playwright() as pw:
             proxy = parse_proxy(PROXY_URL) if PROXY_URL else None
+            print(f"🌐 Используется прокси: {proxy}")  # 👈 обязательно
             browser = await pw.chromium.launch(headless=HEADLESS, proxy=proxy)
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:114.0) Gecko/20100101 Firefox/114.0",
