@@ -44,7 +44,7 @@ async def fetch_categories():
                 locale="ru-RU"
             )
             page = await context.new_page()
-            await page.goto(WB_MAIN_CATALOG, timeout=60000)
+            await page.goto(WB_MAIN_CATALOG, timeout=60000, wait_until="domcontentloaded")
             html = await page.content()
             await browser.close()
 
