@@ -2,33 +2,62 @@ import os
 import logging
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
-# 📦 Константы
+# 🔧 Настройка логов
+logging.basicConfig(level=logging.INFO)
+
+# 🌍 Основные константы
 WB_BASE_URL = "https://www.wildberries.ru"
 WB_MAIN_CATALOG = f"{WB_BASE_URL}/catalog"
 
+# 📦 Заголовки максимально приближенные к реальному браузеру
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:114.0) Gecko/20100101 Firefox/114.0",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Encoding": "gzip, deflate, br",
     "Accept-Language": "ru,en;q=0.9",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1"
 }
 
-logging.basicConfig(level=logging.INFO)
+# 🛡 Поддержка прокси из переменных окружения
+PROXY_URL = os.getenv("PROXY_URL", "")
+PROXIES = {
+    "http": PROXY_URL,
+    "https": PROXY_URL
+} if PROXY_URL else None
+
+if PROXY_URL:
+    logging.info(f"🌐 Используется прокси: {PROXIES}")
 
 
-# 📁 Категории WB
+# 📁 Получение списка категорий
 def fetch_categories():
     categories = {}
+
     try:
-        resp = requests.get(WB_MAIN_CATALOG, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
+        resp = requests.get(WB_MAIN_CATALOG, headers=HEADERS, proxies=PROXIES, timeout=15)
+
+        if resp.status_code != 200:
+            logging.error(f"[fetch_categories] Код ответа: {resp.status_code}")
+            return {}
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
         for a in soup.select("a.menu-burger__main-list-link"):
             name = a.get_text(strip=True)
             href = a.get("href")
+
             if name and href and href.startswith("/catalog"):
-                categories[name] = WB_BASE_URL + href
+                categories[name] = urljoin(WB_BASE_URL, href)
 
         logging.info(f"[fetch_categories] Найдено категорий: {len(categories)}")
 
@@ -38,15 +67,18 @@ def fetch_categories():
     return categories
 
 
-# 📦 Парсинг товаров в категории (упрощённо)
+# 📦 Получение товаров из категории
 def fetch_products_for_category(category_url, max_pages=1):
     products = []
 
     try:
         for page in range(1, max_pages + 1):
             url = f"{category_url}?page={page}"
-            resp = requests.get(url, headers=HEADERS, timeout=20)
-            resp.raise_for_status()
+            resp = requests.get(url, headers=HEADERS, proxies=PROXIES, timeout=15)
+
+            if resp.status_code != 200:
+                logging.warning(f"[fetch_products_for_category] Код ответа: {resp.status_code} для страницы {url}")
+                continue
 
             soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -60,14 +92,14 @@ def fetch_products_for_category(category_url, max_pages=1):
                     name = name_tag.get_text(strip=True)
                     price = int(price_tag.get_text(strip=True).replace("₽", "").replace(" ", ""))
                     bonus = 0
+
                     if bonus_tag:
                         try:
-                            bonus_text = bonus_tag.get_text(strip=True)
-                            bonus = int("".join(filter(str.isdigit, bonus_text)))
-                        except:
+                            bonus = int("".join(filter(str.isdigit, bonus_tag.get_text(strip=True))))
+                        except ValueError:
                             pass
 
-                    link = WB_BASE_URL + link_tag.get("href")
+                    link = urljoin(WB_BASE_URL, link_tag.get("href"))
 
                     products.append({
                         "name": name,
