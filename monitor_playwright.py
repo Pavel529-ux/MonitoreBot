@@ -1,55 +1,28 @@
 import os
-import re
-import json
 import logging
-
-from playwright.async_api import async_playwright
+import requests
 from bs4 import BeautifulSoup
 
-# 📦 Настройки из окружения
+# 📦 Константы
 WB_BASE_URL = "https://www.wildberries.ru"
 WB_MAIN_CATALOG = f"{WB_BASE_URL}/catalog"
-PROXY_URL = os.getenv("PROXY_URL", "").strip()
-HEADLESS = os.getenv("HEADLESS", "1") != "0"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:114.0) Gecko/20100101 Firefox/114.0",
+    "Accept-Language": "ru,en;q=0.9",
+}
 
 logging.basicConfig(level=logging.INFO)
 
 
-# 🔧 Прокси парсер
-def parse_proxy(url):
-    if not url or not url.startswith("http"):
-        return None
-    try:
-        body = url.split("://", 1)[1]
-        if "@" in body:
-            creds, host = body.split("@", 1)
-            if ":" in creds:
-                user, pwd = creds.split(":", 1)
-                server = url.split("://")[0] + "://" + host
-                return {"server": server, "username": user, "password": pwd}
-        return {"server": url}
-    except Exception:
-        return {"server": url}
-
-
-# 📁 Парсинг категорий Wildberries
-async def fetch_categories():
+# 📁 Категории WB
+def fetch_categories():
     categories = {}
     try:
-        async with async_playwright() as pw:
-            proxy = parse_proxy(PROXY_URL) if PROXY_URL else None
-            print(f"🌐 Используется прокси: {proxy}")  # 👈 обязательно
-            browser = await pw.chromium.launch(headless=HEADLESS, proxy=proxy)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:114.0) Gecko/20100101 Firefox/114.0",
-                locale="ru-RU"
-            )
-            page = await context.new_page()
-            await page.goto(WB_MAIN_CATALOG, timeout=60000, wait_until="domcontentloaded")
-            html = await page.content()
-            await browser.close()
+        resp = requests.get(WB_MAIN_CATALOG, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
 
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(resp.text, "html.parser")
 
         for a in soup.select("a.menu-burger__main-list-link"):
             name = a.get_text(strip=True)
@@ -57,7 +30,7 @@ async def fetch_categories():
             if name and href and href.startswith("/catalog"):
                 categories[name] = WB_BASE_URL + href
 
-        logging.info(f"[fetch_categories] Загружено категорий: {len(categories)}")
+        logging.info(f"[fetch_categories] Найдено категорий: {len(categories)}")
 
     except Exception as e:
         logging.error("[fetch_categories] Ошибка: %s", repr(e))
@@ -65,52 +38,43 @@ async def fetch_categories():
     return categories
 
 
-# 📦 Парсинг товаров по ссылке категории
-async def fetch_products_for_category(category_url, max_pages=3):
-    """
-    Парсит список товаров из категории WB.
-    Возвращает список словарей с товарами.
-    """
+# 📦 Парсинг товаров в категории (упрощённо)
+def fetch_products_for_category(category_url, max_pages=1):
     products = []
 
     try:
-        async with async_playwright() as pw:
-            proxy = parse_proxy(PROXY_URL) if PROXY_URL else None
-            browser = await pw.chromium.launch(headless=HEADLESS, proxy=proxy)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:114.0) Gecko/20100101 Firefox/114.0",
-                locale="ru-RU"
-            )
-            page = await context.new_page()
+        for page in range(1, max_pages + 1):
+            url = f"{category_url}?page={page}"
+            resp = requests.get(url, headers=HEADERS, timeout=20)
+            resp.raise_for_status()
 
-            for page_num in range(1, max_pages + 1):
-                url = f"{category_url}?page={page_num}"
-                await page.goto(url, timeout=45000)
-                html = await page.content()
+            soup = BeautifulSoup(resp.text, "html.parser")
 
-                match = re.search(r"window\.__WIDGET__ = (\{.*?\});", html)
-                if not match:
-                    continue
+            for card in soup.select("div.product-card"):
+                name_tag = card.select_one(".product-card__name")
+                price_tag = card.select_one(".price__lower-price")
+                bonus_tag = card.select_one(".product-card__bonus-percent")
+                link_tag = card.select_one("a")
 
-                data_raw = match.group(1)
-                data = json.loads(data_raw)
+                if name_tag and price_tag and link_tag:
+                    name = name_tag.get_text(strip=True)
+                    price = int(price_tag.get_text(strip=True).replace("₽", "").replace(" ", ""))
+                    bonus = 0
+                    if bonus_tag:
+                        try:
+                            bonus_text = bonus_tag.get_text(strip=True)
+                            bonus = int("".join(filter(str.isdigit, bonus_text)))
+                        except:
+                            pass
 
-                widgets = data.get("widgets", {})
-                for widget in widgets.values():
-                    for good in widget.get("items", []):
-                        name = good.get("name")
-                        price = good.get("priceU", 0) // 100
-                        bonus = good.get("rewardAmount", 0) // 100
-                        url = f"https://www.wildberries.ru/catalog/{good.get('id')}/detail.aspx"
-                        if name and price:
-                            products.append({
-                                "name": name,
-                                "price": price,
-                                "bonus": bonus,
-                                "url": url
-                            })
+                    link = WB_BASE_URL + link_tag.get("href")
 
-            await browser.close()
+                    products.append({
+                        "name": name,
+                        "price": price,
+                        "bonus": bonus,
+                        "url": link
+                    })
 
         logging.info(f"[fetch_products_for_category] Найдено товаров: {len(products)}")
 

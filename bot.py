@@ -29,7 +29,7 @@ dp = Dispatcher()
 
 # 🔘 Клавиатура категорий
 async def get_keyboard():
-    categories = await fetch_categories()
+    categories = fetch_categories()
     if not categories:
         return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Категории не найдены", callback_data="none")]])
     buttons = [
@@ -54,7 +54,7 @@ async def category_handler(callback: CallbackQuery):
     await callback.message.edit_text("🔎 Ищу товары, подождите...")
 
     try:
-        items = await fetch_products_for_category(url)
+        items = fetch_products_for_category(url)
 
         filtered = [
             item for item in items
