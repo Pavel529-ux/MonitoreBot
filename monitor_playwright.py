@@ -1,13 +1,21 @@
-# monitor_playwright.py
-
 import os
 import re
 import requests
+import random
+import time
 from bs4 import BeautifulSoup
 
 # Настройки
 WB_BASE_URL = "https://www.wildberries.ru"
 WB_MAIN_CATALOG = f"{WB_BASE_URL}/catalog"
+PROXY_URL = os.getenv("WB_PROXY_URL")
+
+# Список возможных User-Agent для обхода 498
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.6 Safari/605.1.15",
+]
 
 def fetch_categories():
     """
@@ -16,14 +24,18 @@ def fetch_categories():
     """
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36",
+            "User-Agent": random.choice(USER_AGENTS),
             "Referer": "https://www.wildberries.ru/",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Accept-Language": "ru,en;q=0.9",
             "Connection": "keep-alive"
         }
 
-        resp = requests.get(WB_MAIN_CATALOG, timeout=10, headers=headers)
+        proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+        time.sleep(random.uniform(1.5, 3.0))  # Антиспам задержка
+
+        resp = requests.get(WB_MAIN_CATALOG, timeout=10, headers=headers, proxies=proxies)
+
         if resp.status_code != 200:
             print("[fetch_categories] Ошибка загрузки:", resp.status_code)
             return {}
@@ -45,7 +57,7 @@ def fetch_categories():
         print("[fetch_categories] Ошибка:", repr(e))
         return {}
 
-# Пример вызова при отладке
+# Пример ручного вызова
 if __name__ == "__main__":
     categories = fetch_categories()
     for name, url in categories.items():
