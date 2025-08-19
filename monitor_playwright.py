@@ -7,27 +7,21 @@ from bs4 import BeautifulSoup
 WB_BASE_URL = "https://www.wildberries.ru"
 WB_MAIN_CATALOG = f"{WB_BASE_URL}/catalog"
 
-# Получаем переменную окружения, если есть
-def envf(name, default=None):
-    val = os.getenv(name)
-    return val if val else default
-
-# Твоя переменная прокси
-PROXY_URL = envf("PROXY_URL", "")
-
 def fetch_categories():
     """
     Загружает основные категории с главной страницы WB
     Возвращает словарь {название: ссылка}
     """
     try:
-        # Важно: отключаем прокси для requests!
-        resp = requests.get(
-            WB_MAIN_CATALOG,
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0"},
-            proxies={}  # отключаем использование прокси
-        )
+        session = requests.Session()
+
+        # Полностью отключаем прокси для этой сессии
+        session.proxies = {"http": None, "https": None}
+
+        resp = session.get(WB_MAIN_CATALOG, timeout=10, headers={
+            "User-Agent": "Mozilla/5.0"
+        })
+
         if resp.status_code != 200:
             print("[fetch_categories] Ошибка загрузки:", resp.status_code)
             return {}
