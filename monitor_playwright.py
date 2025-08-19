@@ -19,10 +19,7 @@ TELEGRAM_CHAT_ID   = envf("TELEGRAM_CHAT_ID", "")
 REDIS_URL          = envf("REDIS_URL", "redis://localhost:6379/0")
 
 # Категории WB (обычные ссылки, ‘|’ между ссылками)
-WB_CATEGORY_URLS   = envf("WB_CATEGORY_URLS", "")
-if not WB_CATEGORY_URLS:
-    print("Нужно задать WB_CATEGORY_URLS (обычные ссылки разделов WB, через |)")
-    sys.exit(1)
+WB_CATEGORY_URLS = ""  # больше не требуется ручной ввод
 
 HEADLESS           = envf("HEADLESS", "1")
 DEBUG              = envf("DEBUG", "0") == "1"
