@@ -7,28 +7,31 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from redis.asyncio import Redis
 
-from monitor_playwright import fetch_categories, fetch_products_for_category  # ✅ Асинхронный парсинг
+from monitor_playwright import fetch_categories, fetch_products_for_category
 
-# 📦 Переменные окружения
+# 🚀 Стартовое сообщение в логи
+print("🚀 Бот запущен")
+
+# 🔐 Переменные окружения
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 REDIS_URL = os.getenv("REDIS_URL")
 BONUS_MIN_PCT = int(os.getenv("BONUS_MIN_PCT", 20))
 BONUS_MIN_RUB = int(os.getenv("BONUS_MIN_RUB", 200))
 
-# 🔌 Redis
+# 📦 Redis
 redis = Redis.from_url(REDIS_URL, decode_responses=True)
 
-# 🤖 Инициализация бота
+# 🤖 Бот и диспетчер
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
-# 🔘 Генерация клавиатуры категорий
+# 🔘 Клавиатура категорий
 async def get_keyboard():
     categories = await fetch_categories()
     if not categories:
-        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Категории не найдены", callback_data="none")]])
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Категории не найдены", callback_data="none")]])
     buttons = [
         [InlineKeyboardButton(text=name, callback_data=f"category:{url}")]
         for name, url in categories.items()
@@ -39,11 +42,12 @@ async def get_keyboard():
 # 🟢 Обработка команды /start
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    print("📥 Получена команда /start")
     kb = await get_keyboard()
     await message.answer("👋 Выберите категорию для поиска товаров с бонусами за отзыв:", reply_markup=kb)
 
 
-# 🟡 Обработка выбора категории
+# 📦 Обработка выбора категории
 @dp.callback_query(F.data.startswith("category:"))
 async def category_handler(callback: CallbackQuery):
     url = callback.data.split(":", 1)[1]
@@ -52,7 +56,6 @@ async def category_handler(callback: CallbackQuery):
     try:
         items = await fetch_products_for_category(url)
 
-        # 🧮 Фильтрация
         filtered = [
             item for item in items
             if item["bonus"] >= BONUS_MIN_RUB and (item["bonus"] / item["price"]) * 100 >= BONUS_MIN_PCT
@@ -62,7 +65,7 @@ async def category_handler(callback: CallbackQuery):
             await callback.message.edit_text("❌ Подходящих товаров не найдено.")
         else:
             text = "🎯 Найденные товары:\n\n"
-            for item in filtered[:10]:  # Ограничим до 10 товаров
+            for item in filtered[:10]:  # максимум 10 товаров
                 text += (
                     f"🛍 <b>{item['name']}</b>\n"
                     f"💰 Цена: {item['price']} ₽\n"
@@ -72,11 +75,11 @@ async def category_handler(callback: CallbackQuery):
             await callback.message.edit_text(text, parse_mode="HTML")
 
     except Exception as e:
-        logging.exception("Ошибка при обработке категории")
+        logging.exception("❗ Ошибка при парсинге товаров")
         await callback.message.edit_text("⚠️ Произошла ошибка при поиске. Попробуйте позже.")
 
 
-# 🚀 Точка входа
+# 🚀 Запуск бота
 async def main():
     await dp.start_polling(bot)
 
