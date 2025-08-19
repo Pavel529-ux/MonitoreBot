@@ -1,3 +1,4 @@
+# monitor_playwright.py
 
 import os
 import re
@@ -9,6 +10,10 @@ WB_BASE_URL = "https://www.wildberries.ru"
 WB_MAIN_CATALOG = f"{WB_BASE_URL}/catalog"
 
 def fetch_categories():
+    """
+    Загружает основные категории с главной страницы WB
+    Возвращает словарь {название: ссылка}
+    """
     try:
         resp = requests.get(WB_MAIN_CATALOG, timeout=10, headers={
             "User-Agent": "Mozilla/5.0"
