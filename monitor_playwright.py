@@ -15,9 +15,15 @@ def fetch_categories():
     Возвращает словарь {название: ссылка}
     """
     try:
-        resp = requests.get(WB_MAIN_CATALOG, timeout=10, headers={
-            "User-Agent": "Mozilla/5.0"
-        })
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36",
+            "Referer": "https://www.wildberries.ru/",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "ru,en;q=0.9",
+            "Connection": "keep-alive"
+        }
+
+        resp = requests.get(WB_MAIN_CATALOG, timeout=10, headers=headers)
         if resp.status_code != 200:
             print("[fetch_categories] Ошибка загрузки:", resp.status_code)
             return {}
