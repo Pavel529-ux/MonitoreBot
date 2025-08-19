@@ -431,3 +431,24 @@ if __name__ == "__main__":
     finally:
         with suppress(Exception):
             if rds: rds.close()
+
+# =========================
+# Автообновление категорий WB
+# =========================
+def fetch_categories():
+    import requests
+    from bs4 import BeautifulSoup
+
+    url = "https://www.wildberries.ru/"
+    response = requests.get(url, timeout=15)
+    soup = BeautifulSoup(response.content, "html.parser")
+    categories = {}
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if href.startswith("/catalog/") and len(href.strip("/").split("/")) == 2:
+            name = a.get_text(strip=True)
+            full_url = f"https://www.wildberries.ru{href}"
+            if name and full_url not in categories.values():
+                categories[name] = full_url
+    return categories
