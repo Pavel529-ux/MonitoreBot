@@ -1,11 +1,12 @@
-# monitor_playwright.py
 import os
+import re
+import json
 import logging
-from contextlib import suppress
-from playwright.async_api import async_playwright, TimeoutError
+
+from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 
-# Настройки
+# 📦 Настройки из окружения
 WB_BASE_URL = "https://www.wildberries.ru"
 WB_MAIN_CATALOG = f"{WB_BASE_URL}/catalog"
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
@@ -13,6 +14,8 @@ HEADLESS = os.getenv("HEADLESS", "1") != "0"
 
 logging.basicConfig(level=logging.INFO)
 
+
+# 🔧 Прокси парсер
 def parse_proxy(url):
     if not url or not url.startswith("http"):
         return None
@@ -29,6 +32,7 @@ def parse_proxy(url):
         return {"server": url}
 
 
+# 📁 Парсинг категорий Wildberries
 async def fetch_categories():
     categories = {}
     try:
@@ -37,11 +41,7 @@ async def fetch_categories():
             browser = await pw.chromium.launch(headless=HEADLESS, proxy=proxy)
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:114.0) Gecko/20100101 Firefox/114.0",
-                locale="ru-RU",
-                extra_http_headers={
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-                }
+                locale="ru-RU"
             )
             page = await context.new_page()
             await page.goto(WB_MAIN_CATALOG, timeout=30000)
@@ -62,3 +62,58 @@ async def fetch_categories():
         logging.error("[fetch_categories] Ошибка: %s", repr(e))
 
     return categories
+
+
+# 📦 Парсинг товаров по ссылке категории
+async def fetch_products_for_category(category_url, max_pages=3):
+    """
+    Парсит список товаров из категории WB.
+    Возвращает список словарей с товарами.
+    """
+    products = []
+
+    try:
+        async with async_playwright() as pw:
+            proxy = parse_proxy(PROXY_URL) if PROXY_URL else None
+            browser = await pw.chromium.launch(headless=HEADLESS, proxy=proxy)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:114.0) Gecko/20100101 Firefox/114.0",
+                locale="ru-RU"
+            )
+            page = await context.new_page()
+
+            for page_num in range(1, max_pages + 1):
+                url = f"{category_url}?page={page_num}"
+                await page.goto(url, timeout=45000)
+                html = await page.content()
+
+                match = re.search(r"window\.__WIDGET__ = (\{.*?\});", html)
+                if not match:
+                    continue
+
+                data_raw = match.group(1)
+                data = json.loads(data_raw)
+
+                widgets = data.get("widgets", {})
+                for widget in widgets.values():
+                    for good in widget.get("items", []):
+                        name = good.get("name")
+                        price = good.get("priceU", 0) // 100
+                        bonus = good.get("rewardAmount", 0) // 100
+                        url = f"https://www.wildberries.ru/catalog/{good.get('id')}/detail.aspx"
+                        if name and price:
+                            products.append({
+                                "name": name,
+                                "price": price,
+                                "bonus": bonus,
+                                "url": url
+                            })
+
+            await browser.close()
+
+        logging.info(f"[fetch_products_for_category] Найдено товаров: {len(products)}")
+
+    except Exception as e:
+        logging.error("[fetch_products_for_category] Ошибка: %s", repr(e))
+
+    return products
